@@ -428,34 +428,57 @@ def join_keyboard(chats, hide_verified=False):
     )
     return InlineKeyboardMarkup(rows)
 
-async def show_join_gate(update, context):
-    chats = active_required_chats()
+async def show_join_gate(update, context, chats=None):
+    if chats is None:
+        chats = active_required_chats()
+
+    if not chats:
+        return await home(update, context)
+
     text = (
         "🔐 <b>VIDEO ACCESS LOCKED</b>\n\n"
-        "Videos unlock karne ke liye required groups/channels join karo.\n\n"
-        f"📌 Required joins: <b>{len(chats)}</b>\n"
-        "✅ Join ya approval request send karne ke baad <b>Verify</b> dabao.\n\n"
-        "ℹ️ Approval-link chat me request aate hi 24h pending access record hota hai.\n"
-        "🎁 Verification ke baad first <b>10 videos</b> unlock ho jayenge."
+        "Sirf neeche diye gaye remaining groups/channels complete karo.\n\n"
+        f"📌 Remaining: <b>{len(chats)}</b>\n"
+        "✅ Join/request complete karne ke baad <b>Verify</b> dabao.\n\n"
+        "ℹ️ Already completed groups dobara show nahi honge."
     )
+
     await update.effective_chat.send_message(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=join_keyboard(chats),
     )
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = await ensure_user(update, context)
-    if doc.get("verified"):
-        _, missing, _ = await membership_result(context.bot, update.effective_user.id)
-        if missing:
-            users.update_one(
-                {"user_id": update.effective_user.id},
-                {"$set": {"verified": False}},
-            )
-            return await show_join_gate(update, context)
+    await ensure_user(update, context)
+
+    uid = update.effective_user.id
+    chats, missing, pending = await membership_result(context.bot, uid)
+
+    if not missing:
+        current = users.find_one({"user_id": uid}) or {}
+        set_data = {
+            "verified": True,
+            "verified_at": utcnow(),
+        }
+        if int(current.get("unlocked_batch", 0)) == 0 and published_batch_count() > 0:
+            set_data["unlocked_batch"] = 1
+
+        users.update_one(
+            {"user_id": uid},
+            {"$set": set_data},
+        )
         return await home(update, context)
-    await show_join_gate(update, context)
+
+    users.update_one(
+        {"user_id": uid},
+        {"$set": {"verified": False}},
+    )
+
+    # Only missing chats are shown. Member/pending chats stay hidden.
+    await show_join_gate(update, context, chats=missing)
+
 
 async def home(update, context):
     d = user_doc(update.effective_user.id) or {}
@@ -511,7 +534,7 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ye joins/request abhi missing hain:\n"
             f"{names}"
             f"{pending_text}\n\n"
-            "Missing chats me join/request complete karke dobara verify karo."
+            "Sirf upar dikh rahe remaining chats complete karke dobara verify karo."
         )
         try:
             await q.edit_message_text(

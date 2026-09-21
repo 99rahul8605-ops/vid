@@ -187,3 +187,17 @@ It shows:
 - current state (`member`, `pending`, `missing`)
 - configured link mode
 - whether the temporary pending record exists
+
+
+## Smarter `/start`
+
+`/start` no longer blindly shows every force-join link.
+
+On every `/start` the bot first verifies all required chats in parallel:
+
+- member -> hidden
+- valid 24h pending approval request -> hidden
+- missing -> only that chat's Join button is shown
+- nothing missing -> Video Vault opens directly
+
+So already-completed groups are never shown again unnecessarily.
