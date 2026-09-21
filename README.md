@@ -164,84 +164,26 @@ Troubleshooting:
 shows per-required-chat state as `member`, `pending`, or `missing`.
 
 
-## Exact fix for dismissed join requests
+## 24-hour approval request verification
 
-Telegram Bot API sends `chat_join_request` when a request is CREATED, but it does
-not provide a reliable matching update when another admin manually dismisses that
-request.
+No Telegram user session is required.
 
-Because of this, this build does **not** trust MongoDB pending records for access.
+- public/custom-link chats: actual membership only
+- approval-link chats: actual membership first
+- if not yet a member, a captured `chat_join_request` remains valid for 24 hours
+- MongoDB TTL deletes the temporary pending record automatically
+- actual join or leave clears that user's pending marker
 
-For exact pending status, configure one Telegram USER session that is admin in
-all required groups/channels:
+For Telegram to send `chat_join_request`, the bot must be an administrator in the
+target chat with the `can_invite_users` right.
 
-```env
-TG_API_ID=123456
-TG_API_HASH=...
-PENDING_ADMIN_SESSION=...
+Debug with:
+
+```text
+/checkme
 ```
 
-The bot then queries Telegram's live pending-request list via MTProto/Telethon
-during verification.
-
-Result:
-
-- actual member -> `member`
-- actually still pending -> `pending`
-- request dismissed/declined -> `missing`
-- stale MongoDB record -> ignored and cleaned
-
-If the admin user session is not configured, the bot fails closed:
-pending requests do not grant access; only actual members pass.
-
-The admin user account must have sufficient admin access to view join requests
-in every required group/channel.
-
-
-## Live-only pending verification
-
-Pending join requests are **not stored in MongoDB** in this build.
-
-When the user presses **Verify**, the bot checks every required chat at that exact moment:
-
-1. Bot API `getChatMember` -> current membership
-2. Telethon/MTProto live pending-request list -> current pending request
-3. Otherwise -> missing
-
-So if an admin dismisses/declines a pending request, the next Verify immediately sees it as `missing`.
-
-MongoDB is still used for normal bot state such as users, referrals, video batches, and deletion jobs, but not as a pending-request source of truth.
-
-
-## Public vs approval/private verification
-
-This build does not need a Telegram user session.
-
-### Public/custom-link chats
-Verification uses current Bot API membership only:
-
-- member/admin/owner -> pass
-- anything else -> missing
-
-### Approval/private chats
-Verification first checks current membership.
-If the user is not yet a member, the bot checks whether it received a recent
-`chat_join_request` update for that user/chat.
-
-That temporary request marker is stored in MongoDB for:
-
-```env
-PENDING_REQUEST_TTL_HOURS=24
-```
-
-A MongoDB TTL index automatically deletes expired markers.
-
-This means:
-- request arrives -> temporary pending access can pass
-- user later becomes a real member -> pending marker is deleted
-- after 24h -> pending marker expires automatically
-- public groups never use the pending fallback
-
-Important limitation: if an admin manually dismisses a request before the TTL
-expires, Bot API does not reliably send a matching "dismissed" event. In this
-design the temporary pending marker may remain valid until the TTL expires.
+It shows:
+- current state (`member`, `pending`, `missing`)
+- configured link mode
+- whether the temporary pending record exists
