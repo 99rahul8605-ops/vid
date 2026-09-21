@@ -143,3 +143,22 @@ The bot now listens to `chat_member` updates for configured required chats.
 - the user must submit a fresh join request / rejoin and verify again
 
 Keep the bot as admin in required chats so Telegram can deliver the relevant membership updates reliably.
+
+
+## Strict membership verification fix
+
+This build treats `getChatMember` as the authoritative current-state check.
+
+- current member/admin/owner -> verified
+- current non-member/left/kicked -> NOT verified
+- a pending request is only accepted if it is fresh
+- if the user left before, an old pending request is invalid
+- only a new join request created after the leave can satisfy pending status
+
+Troubleshooting:
+
+```text
+/checkme
+```
+
+shows per-required-chat state as `member`, `pending`, or `missing`.
