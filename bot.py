@@ -11,6 +11,11 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import GetChatInviteImportersRequest
+from telethon.tl.types import InputUserEmpty
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,6 +37,12 @@ STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
 DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
+
+# Optional but recommended for exact pending-request verification.
+# This user account must be admin in every required group/channel.
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or 0)
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+PENDING_ADMIN_SESSION = os.getenv("PENDING_ADMIN_SESSION", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +73,8 @@ pending_requests.create_index([("requested_at", ASCENDING)])
 membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
+
+PENDING_CLIENT = None
 
 USER_MENU = ReplyKeyboardMarkup(
     [
@@ -134,10 +147,49 @@ async def deletion_worker(app: Application):
         await asyncio.sleep(30)
 
 async def post_init(app: Application):
+    global PENDING_CLIENT
+
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
     app.create_task(deletion_worker(app), name="video-cleanup")
+
+    # Exact live pending-request checker.
+    # Fail closed if not configured: pending requests will NOT grant access.
+    if TG_API_ID and TG_API_HASH and PENDING_ADMIN_SESSION:
+        try:
+            PENDING_CLIENT = TelegramClient(
+                StringSession(PENDING_ADMIN_SESSION),
+                TG_API_ID,
+                TG_API_HASH,
+            )
+            await PENDING_CLIENT.connect()
+            if not await PENDING_CLIENT.is_user_authorized():
+                log.error("PENDING_ADMIN_SESSION is not authorized; live pending check disabled")
+                await PENDING_CLIENT.disconnect()
+                PENDING_CLIENT = None
+            else:
+                log.info("Live pending-request checker enabled")
+        except Exception:
+            log.exception("Failed to start live pending checker")
+            PENDING_CLIENT = None
+    else:
+        log.warning(
+            "Live pending checker not configured. "
+            "Pending requests will not count as verified; only actual membership will."
+        )
+
     log.info("Bot started as @%s", me.username)
+
+
+async def post_shutdown(app: Application):
+    global PENDING_CLIENT
+    if PENDING_CLIENT is not None:
+        try:
+            await PENDING_CLIENT.disconnect()
+        except Exception:
+            pass
+        PENDING_CLIENT = None
+
 
 async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -338,12 +390,91 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
             pass
 
 
+async def is_live_pending_request(chat_id: int, user_id: int) -> bool:
+    """
+    Exact pending check using an admin USER session via Telegram MTProto.
+
+    Bot API only emits an update when a join request is created. It does not
+    provide a reliable "request was dismissed by another admin" update.
+    Therefore MongoDB is not treated as authoritative here.
+
+    If the live checker is unavailable/erroring, this function returns False
+    (fail closed), so stale pending records can never grant access.
+    """
+    client = PENDING_CLIENT
+    if client is None:
+        return False
+
+    try:
+        peer = await client.get_input_entity(chat_id)
+
+        # Telegram returns pending importers in pages. We scan pages until:
+        # - user is found, or
+        # - there are no more pending requests.
+        offset_date = 0
+        offset_user = InputUserEmpty()
+
+        for _ in range(20):  # up to ~2000 pending requests with limit=100
+            result = await client(
+                GetChatInviteImportersRequest(
+                    peer=peer,
+                    requested=True,
+                    offset_date=offset_date,
+                    offset_user=offset_user,
+                    limit=100,
+                    link=None,
+                    q=None,
+                )
+            )
+
+            importers = list(getattr(result, "importers", []) or [])
+            if not importers:
+                return False
+
+            for importer in importers:
+                if int(getattr(importer, "user_id", 0) or 0) == int(user_id):
+                    return True
+
+            if len(importers) < 100:
+                return False
+
+            last = importers[-1]
+            last_uid = int(getattr(last, "user_id", 0) or 0)
+            last_date = getattr(last, "date", None)
+
+            if not last_uid:
+                return False
+
+            try:
+                offset_user = await client.get_input_entity(last_uid)
+            except Exception:
+                return False
+
+            if hasattr(last_date, "timestamp"):
+                offset_date = int(last_date.timestamp())
+            elif isinstance(last_date, int):
+                offset_date = last_date
+            else:
+                return False
+
+        return False
+
+    except Exception as e:
+        log.warning(
+            "Live pending lookup failed chat=%s user=%s error=%s",
+            chat_id,
+            user_id,
+            type(e).__name__,
+        )
+        return False
+
+
 async def check_one_chat(bot, ch, uid):
     """
-    Authoritative verification:
-    1. getChatMember says current member/admin/owner -> MEMBER
-    2. otherwise, only a fresh join request can count as PENDING
-    3. left/kicked/banned/non-member never counts as MEMBER
+    Verification order:
+    1) Bot API current membership is authoritative.
+    2) If not a member, live Telegram pending list is queried via admin USER session.
+    3) MongoDB pending records are informational only and never grant access.
     """
     chat_id = ch["chat_id"]
 
@@ -368,13 +499,13 @@ async def check_one_chat(bot, ch, uid):
                     "$set": {
                         "is_member": True,
                         "last_seen_member_at": utcnow(),
+                        "last_status": str(status),
                     }
                 },
                 upsert=True,
             )
             return ch, "member"
 
-        # Telegram explicitly says not a current member.
         membership_events.update_one(
             {"chat_id": chat_id, "user_id": uid},
             {
@@ -388,18 +519,46 @@ async def check_one_chat(bot, ch, uid):
         )
 
     except TelegramError as e:
-        # If current membership cannot be checked, do NOT grant member access.
         log.warning(
             "getChatMember failed chat=%s user=%s error=%s",
             chat_id,
             uid,
             type(e).__name__,
         )
+        # We may still check live pending below.
 
-    pending = await asyncio.to_thread(
-        pending_request_is_recent, chat_id, uid
+    # IMPORTANT: exact live query, not MongoDB guess.
+    live_pending = await is_live_pending_request(chat_id, uid)
+
+    if live_pending:
+        membership_events.update_one(
+            {"chat_id": chat_id, "user_id": uid},
+            {
+                "$set": {
+                    "is_member": False,
+                    "live_pending": True,
+                    "live_pending_checked_at": utcnow(),
+                }
+            },
+            upsert=True,
+        )
+        return ch, "pending"
+
+    # If request was dismissed/declined, live list no longer contains the user.
+    # Clean stale local event so it cannot confuse future diagnostics.
+    pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
+    membership_events.update_one(
+        {"chat_id": chat_id, "user_id": uid},
+        {
+            "$set": {
+                "is_member": False,
+                "live_pending": False,
+                "live_pending_checked_at": utcnow(),
+            }
+        },
+        upsert=True,
     )
-    return ch, ("pending" if pending else "missing")
+    return ch, "missing"
 
 
 async def membership_result(bot, uid):
@@ -1200,6 +1359,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
