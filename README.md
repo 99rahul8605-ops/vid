@@ -131,3 +131,15 @@ python3 bot.py
 ➕ Add Required Group 👥 Required Groups
 📊 Bot Stats          ❌ Cancel
 ```
+
+
+## Leave detection fix
+
+The bot now listens to `chat_member` updates for configured required chats.
+
+- member joins/gets approved -> stale pending request is removed
+- member leaves/is removed -> verification is revoked immediately
+- old pending requests from before the leave no longer satisfy verification
+- the user must submit a fresh join request / rejoin and verify again
+
+Keep the bot as admin in required chats so Telegram can deliver the relevant membership updates reliably.

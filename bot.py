@@ -15,6 +15,7 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -49,6 +50,7 @@ batches = db.video_batches
 pending_deletions = db.pending_deletions
 drafts = db.upload_drafts
 pending_requests = db.pending_join_requests
+membership_events = db.membership_events
 
 users.create_index([("user_id", ASCENDING)], unique=True)
 required_chats.create_index([("chat_id", ASCENDING)], unique=True)
@@ -57,6 +59,7 @@ pending_deletions.create_index([("delete_at", ASCENDING)])
 drafts.create_index([("admin_id", ASCENDING)], unique=True)
 pending_requests.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 pending_requests.create_index([("requested_at", ASCENDING)])
+membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
 
@@ -195,15 +198,85 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def pending_request_is_recent(chat_id: int, user_id: int) -> bool:
     cutoff = utcnow() - timedelta(hours=PENDING_REQUEST_TTL_HOURS)
-    return bool(
-        pending_requests.find_one(
-            {
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "requested_at": {"$gte": cutoff},
-            }
-        )
+    req = pending_requests.find_one(
+        {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "requested_at": {"$gte": cutoff},
+        }
     )
+    if not req:
+        return False
+
+    evt = membership_events.find_one({"chat_id": chat_id, "user_id": user_id}) or {}
+    last_leave_at = evt.get("last_leave_at")
+    if last_leave_at and req.get("requested_at") and req["requested_at"] <= last_leave_at:
+        return False
+    return True
+
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.chat_member
+    if not cmu:
+        return
+
+    chat_id = cmu.chat.id
+    uid = cmu.new_chat_member.user.id
+
+    # We only care about force-join chats configured in this bot.
+    if not required_chats.find_one({"chat_id": chat_id, "enabled": True}):
+        return
+
+    old_status = cmu.old_chat_member.status
+    new_status = cmu.new_chat_member.status
+
+    active_statuses = {
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    }
+
+    new_is_member = new_status in active_statuses
+    if new_status == ChatMemberStatus.RESTRICTED:
+        new_is_member = bool(getattr(cmu.new_chat_member, "is_member", False))
+
+    old_is_member = old_status in active_statuses
+    if old_status == ChatMemberStatus.RESTRICTED:
+        old_is_member = bool(getattr(cmu.old_chat_member, "is_member", False))
+
+    now = utcnow()
+
+    if new_is_member:
+        pending_requests.delete_one({"chat_id": chat_id, "user_id": uid})
+        membership_events.update_one(
+            {"chat_id": chat_id, "user_id": uid},
+            {"$set": {"last_join_at": now, "is_member": True}},
+            upsert=True,
+        )
+        return
+
+    if old_is_member and not new_is_member:
+        # User left / was removed. Any older pending request must not keep access alive.
+        pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
+        membership_events.update_one(
+            {"chat_id": chat_id, "user_id": uid},
+            {"$set": {"last_leave_at": now, "is_member": False}},
+            upsert=True,
+        )
+        users.update_one(
+            {"user_id": uid},
+            {"$set": {"verified": False, "verification_revoked_at": now}},
+        )
+        try:
+            await context.bot.send_message(
+                uid,
+                "🔒 <b>Access Locked Again</b>\n\n"
+                "Aap required group/channel se leave ho gaye ho. "
+                "Videos/referral access continue karne ke liye dobara required joins complete karke verify karo.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+
 
 async def check_one_chat(bot, ch, uid):
     """
@@ -221,6 +294,11 @@ async def check_one_chat(bot, ch, uid):
             ok = bool(getattr(member, "is_member", False))
         if ok:
             pending_requests.delete_one({"chat_id": ch["chat_id"], "user_id": uid})
+            membership_events.update_one(
+                {"chat_id": ch["chat_id"], "user_id": uid},
+                {"$set": {"last_join_at": utcnow(), "is_member": True}},
+                upsert=True,
+            )
             return ch, "member"
     except TelegramError:
         pass
@@ -1011,6 +1089,7 @@ def main():
     app.add_handler(CommandHandler("setcustomlink", set_custom_link))
 
     app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     app.add_handler(
         CallbackQueryHandler(verify_join, pattern=r"^verify_join$")
