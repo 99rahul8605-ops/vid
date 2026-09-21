@@ -982,6 +982,11 @@ async def admin_group_flow(update, context):
     st = ADMIN_STATE.get(ADMIN_ID)
     text = (update.message.text or "").strip()
 
+    # Second-layer safety: never try to parse cancel as a chat ID/URL.
+    if text.casefold() in {"cancel", "/cancel", "❌ cancel"}:
+        await cancel(update, context)
+        return True
+
     if st == "group_chat_id":
         try:
             cid = int(text)
@@ -1148,6 +1153,10 @@ async def cancel(update, context):
 
 async def text_router(update, context):
     txt = (update.message.text or "").strip()
+    normalized = txt.casefold()
+
+    if update.effective_user.id == ADMIN_ID and normalized in {"cancel", "/cancel", "❌ cancel"}:
+        return await cancel(update, context)
 
     if update.effective_user.id == ADMIN_ID:
         if await admin_group_flow(update, context):

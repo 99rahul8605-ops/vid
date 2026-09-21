@@ -218,3 +218,12 @@ or:
 ```
 
 Cancel clears custom-link state, group-add state, upload draft state, and restores the admin menu.
+
+
+## Cancel parsing fix v2
+
+`cancel`, `Cancel`, `/cancel`, and the `❌ Cancel` button are now handled
+case-insensitively before any numeric chat-ID parsing.
+
+So typing `cancel` inside `/setcustomlink` can no longer produce
+`Invalid numeric chat ID`.
