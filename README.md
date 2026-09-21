@@ -201,3 +201,20 @@ On every `/start` the bot first verifies all required chats in parallel:
 - nothing missing -> Video Vault opens directly
 
 So already-completed groups are never shown again unnecessarily.
+
+
+## Cancel-flow fix
+
+Admin flows can now always be cancelled with either:
+
+```text
+❌ Cancel
+```
+
+or:
+
+```text
+/cancel
+```
+
+Cancel clears custom-link state, group-add state, upload draft state, and restores the admin menu.
