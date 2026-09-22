@@ -277,3 +277,20 @@ UPLOAD_DELAY_SECONDS=2
 ```
 
 Keep your existing `.env` credentials and MongoDB; the ZIP contains `.env.example`, not your live `.env`.
+
+
+## Live storage upload progress (new)
+
+During **📤 Upload Videos** a separate **📊 LIVE STORAGE UPLOAD** bot-owned message is created and edited approximately every 3 seconds while uploading. It shows: received, copied to storage, failed, pending, percent of currently received videos processed, current source video and countdown when Telegram applies `RetryAfter`. Copy successes/failures are read from MongoDB, so it does not misreport a video as stored simply because Telegram received it. No extra message is sent per video.
+
+Use the **📊 Upload Status** reply-keyboard button or `/uploadstatus` for a fresh one-time snapshot. `DONE` keeps the live message updating while it drains the queue. If you need to retry failures, the live message continues; on completion or cancellation it is closed. An old draft's persisted counts remain available after restart, but a running Telegram transfer cannot survive a process restart.
+
+Optional `.env`:
+
+```env
+UPLOAD_CONCURRENCY=1
+UPLOAD_DELAY_SECONDS=2
+UPLOAD_PROGRESS_REFRESH_SECONDS=3
+```
+
+Telegram may still apply FloodWait; the progress display is intentionally throttled and will not override Telegram's required wait.
