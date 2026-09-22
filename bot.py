@@ -32,7 +32,11 @@ STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
 DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
-UPLOAD_CONCURRENCY = max(1, min(6, int(os.getenv("UPLOAD_CONCURRENCY", "3"))))
+# Storage-channel copying is intentionally serialized even if an older .env
+# still contains UPLOAD_CONCURRENCY=3. One worker avoids overlapping 429s.
+UPLOAD_CONCURRENCY = 1
+# Minimum time BETWEEN completed copy attempts (success or failure).
+UPLOAD_COPY_GAP_SECONDS = max(2.0, float(os.getenv("UPLOAD_DELAY_SECONDS", os.getenv("UPLOAD_COPY_GAP_SECONDS", "2"))))
 UPLOAD_MAX_RETRIES = max(1, min(8, int(os.getenv("UPLOAD_MAX_RETRIES", "5"))))
 
 logging.basicConfig(
@@ -883,12 +887,14 @@ async def admin_upload_start(update, context):
         "semaphore": asyncio.Semaphore(UPLOAD_CONCURRENCY),
         "tasks": set(), "closing": False, "seen": seen,
         "submitted": submitted, "cooldown_until": 0.0,
+        "next_copy_at": 0.0, "storage_send_lock": asyncio.Lock(),
     }
     ADMIN_STATE[ADMIN_ID] = "upload_videos"
     await update.message.reply_text(
         "🚀 <b>STORAGE UPLOAD</b>\n\n"
-        f"Parallel copies: <b>{UPLOAD_CONCURRENCY}</b>\n"
-        "Telegram flood wait aaya to automatically wait + retry hoga. "
+        "Storage copy workers: <b>1 (sequential)</b>\n"
+        f"Gap between copies: <b>{UPLOAD_COPY_GAP_SECONDS:g}s</b>\n"
+        "Telegram RetryAfter aaya to poori queue required time tak pause hogi. "
         "Every successful storage copy MongoDB me save hoga. "
         "DONE par errors report honge; failures ko Retry Failed se dobara try kar sakte ho.",
         parse_mode=ParseMode.HTML,
@@ -922,25 +928,60 @@ def _safe_error(exc):
 
 
 async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
+    # Exactly one storage-copy job runs at once. The extra lock explicitly
+    # serializes Telegram sends so future changes to task concurrency cannot
+    # accidentally bypass the SHARED cooldown and inter-copy gap.
     async with runtime["semaphore"]:
         reason = "Unknown"
         for attempt in range(UPLOAD_MAX_RETRIES):
             try:
-                # One bot-wide backoff gate: RetryAfter from one copy pauses
-                # the other workers too instead of triggering repeated floods.
-                sleep_for = runtime["cooldown_until"] - asyncio.get_running_loop().time()
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-                copied = await bot.copy_message(
-                    chat_id=STORAGE_CHANNEL_ID,
-                    from_chat_id=src_chat_id,
-                    message_id=source_id,
-                    protect_content=False,
-                    read_timeout=60,
-                    write_timeout=60,
-                    connect_timeout=20,
-                    pool_timeout=30,
-                )
+                async with runtime["storage_send_lock"]:
+                    loop = asyncio.get_running_loop()
+                    # Both the normal 2-second gap and ANY worker's flood-wait
+                    # apply to the next request. No copy can race past this gate.
+                    delay = max(
+                        runtime["cooldown_until"],
+                        runtime["next_copy_at"],
+                    ) - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                    try:
+                        copied = await bot.copy_message(
+                            chat_id=STORAGE_CHANNEL_ID,
+                            from_chat_id=src_chat_id,
+                            message_id=source_id,
+                            protect_content=False,
+                            read_timeout=60,
+                            write_timeout=60,
+                            connect_timeout=20,
+                            pool_timeout=30,
+                        )
+                    except RetryAfter as exc:
+                        # Extend the BOT-WIDE storage cooldown; even queued
+                        # work must honor Telegram's full wait before sending.
+                        wait = float(exc.retry_after) + 1.0
+                        runtime["cooldown_until"] = max(
+                            runtime["cooldown_until"],
+                            loop.time() + wait,
+                        )
+                        reason = f"RetryAfter ({round(wait)}s)"
+                        log.warning(
+                            "Storage rate-limited. Pausing storage queue for %ss",
+                            round(wait),
+                        )
+                        # Never retry before the normal gap either.
+                        runtime["next_copy_at"] = loop.time() + UPLOAD_COPY_GAP_SECONDS
+                        continue
+                    finally:
+                        # Starts the 2-second gap AFTER the preceding attempt
+                        # finishes (not merely between attempt start times).
+                        runtime["next_copy_at"] = max(
+                            runtime["next_copy_at"],
+                            loop.time() + UPLOAD_COPY_GAP_SECONDS,
+                        )
+
+                # Retain the old crash-resilient MongoDB source→storage mapping.
                 drafts.update_one(
                     {"admin_id": ADMIN_ID},
                     {
@@ -952,31 +993,24 @@ async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
                     },
                 )
                 return
-            except RetryAfter as exc:
-                wait = float(exc.retry_after) + 1
-                runtime["cooldown_until"] = max(
-                    runtime["cooldown_until"],
-                    asyncio.get_running_loop().time() + wait,
-                )
-                reason = f"RetryAfter ({round(wait)}s)"
-                log.warning("Storage rate-limited. Telegram requires waiting %ss", round(wait))
             except (TimedOut, NetworkError) as exc:
                 reason = type(exc).__name__
-                # Telegram may have copied a video before a request times out;
-                # retry can occasionally create a duplicate storage message.
+                # The server may have copied a video before the timeout.
+                # A retry might create an extra storage message.
                 if attempt + 1 < UPLOAD_MAX_RETRIES:
-                    await asyncio.sleep(min(2**attempt, 16))
+                    await asyncio.sleep(min(2 ** attempt, 16))
             except (BadRequest, Forbidden) as exc:
                 reason = _safe_error(exc)
                 log.warning("Storage copy source=%s: %s", source_id, reason)
-                break  # permanent error; retrying will not repair permissions
+                break
             except TelegramError as exc:
                 reason = _safe_error(exc)
                 log.warning("Storage copy source=%s: %s", source_id, reason)
                 if attempt + 1 < UPLOAD_MAX_RETRIES:
-                    await asyncio.sleep(min(2**attempt, 16))
+                    await asyncio.sleep(min(2 ** attempt, 16))
             except asyncio.CancelledError:
                 raise
+
         drafts.update_one(
             {"admin_id": ADMIN_ID},
             {"$pull": {"failed": {"source_message_id": source_id}}},

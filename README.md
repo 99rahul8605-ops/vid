@@ -248,11 +248,32 @@ New videos copied to the storage channel use `protect_content=False`. Copies del
 ## Storage copy retry and error diagnostics
 
 - Copying media to storage uses Telegram `copy_message` (no server-side download/upload).
-- Default three simultaneous copies; Telegram rate limits pause all workers.
+- Latest build uses one storage copy worker with a minimum 2-second gap, and a shared Telegram cooldown.
 - Completed source/storage message mappings are stored in MongoDB before DONE.
 - DONE drains outstanding copies and reports failures by source message ID and safe error type.
 - Retry Failed retries only unsuccessful video IDs, without reuploading the first successful videos.
 - Publish Successful explicitly skips failed videos and publishes successes in their original source-message order.
-- For very large batches, reduce `UPLOAD_CONCURRENCY=2` if Telegram throttles.
+- For very large batches, keep sequential copying. Increase `UPLOAD_COPY_GAP_SECONDS` above 2 if Telegram still throttles.
 - On a network timeout, Telegram may have copied the video even if the response was lost; retries can leave extra copies in the storage channel.
 - When upgrading during an unfinished upload from an older version, complete the old version's DONE first so no draft is overwritten.
+
+
+## Storage pacing / shared FloodWait fix (latest)
+
+- **One** storage-copy worker, even if the old server `.env` says `UPLOAD_CONCURRENCY=3`.
+- At least **2 seconds after each copy attempt** before the next starts; configurable upward with `UPLOAD_DELAY_SECONDS=2` (also accepts legacy `UPLOAD_COPY_GAP_SECONDS=2`).
+- On Telegram `RetryAfter`, the **entire storage copy queue** waits the time Telegram requests, plus a 1-second cushion.
+- Uploads are still `copy_message` to the storage channel (`protect_content=False`); no download or re-upload is needed. Users' delivered videos are still protected and deleted after 12 hours.
+- `DONE` waits for queued copies; source message order is preserved when making 10-video batches. `Retry Failed` continues to retry failed source message IDs.
+- The required Telegram wait cannot be overridden; 2 seconds is a pacing starting point, not a guarantee that Telegram will never apply limits.
+
+**Upgrade:** If an upload is active, finish it using `DONE` on the old bot, then stop it and install this zip. Existing `.env` and MongoDB are reused.
+
+## Server settings
+
+```env
+UPLOAD_CONCURRENCY=1
+UPLOAD_DELAY_SECONDS=2
+```
+
+Keep your existing `.env` credentials and MongoDB; the ZIP contains `.env.example`, not your live `.env`.
