@@ -75,7 +75,8 @@ ADMIN_MENU = ReplyKeyboardMarkup(
     [
         ["📤 Upload Videos", "📚 Video Batches"],
         ["➕ Add Required Group", "👥 Required Groups"],
-        ["📊 Bot Stats", "❌ Cancel"],
+        ["🗑 Remove Required Channel", "📊 Bot Stats"],
+        ["❌ Cancel"],
     ],
     resize_keyboard=True,
 )
@@ -1118,6 +1119,114 @@ async def admin_groups(update, context):
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
+# Removing a required chat does NOT delete its Telegram channel or revoke its invite link.
+# This only removes its force-join requirement and related temporary verification data.
+REMOVE_PAGE_SIZE = 8
+
+
+def remove_chat_list_markup(page=0):
+    rows = list(required_chats.find().sort("position", ASCENDING))
+    if not rows:
+        return None, 0, 0
+    last_page = (len(rows) - 1) // REMOVE_PAGE_SIZE
+    page = min(max(int(page), 0), last_page)
+    start = page * REMOVE_PAGE_SIZE
+    buttons = [
+        [InlineKeyboardButton(
+            "🗑 " + str(c.get("name", c["chat_id"]))[:48],
+            callback_data=f"rm_pick:{c['chat_id']}",
+        )]
+        for c in rows[start:start+REMOVE_PAGE_SIZE]
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"rm_list:{page-1}"))
+    if page < last_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"rm_list:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rm_cancel")])
+    return InlineKeyboardMarkup(buttons), page, len(rows)
+
+
+async def admin_remove_chat_menu(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    markup, page, total = remove_chat_list_markup()
+    if not markup:
+        await update.message.reply_text("ℹ️ Koi required group/channel configured nahi hai.", reply_markup=ADMIN_MENU)
+        return
+    await update.message.reply_text(
+        f"🗑 <b>REMOVE REQUIRED CHANNEL</b>\n\n"
+        f"Konsa group/channel force-join se hatana hai? ({total} total)\n"
+        "Channel khud delete nahi hoga; sirf bot ki required list se hatega.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+
+async def remove_chat_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Admin only", show_alert=True)
+        return
+    data = q.data or ""
+    if data == "rm_cancel":
+        await q.answer()
+        await q.edit_message_text("✅ Remove operation cancelled.")
+        return
+    if data.startswith("rm_list:"):
+        await q.answer()
+        markup, page, total = remove_chat_list_markup(int(data.split(":", 1)[1]))
+        if markup:
+            await q.edit_message_text(
+                f"🗑 <b>REMOVE REQUIRED CHANNEL</b>\n\nSelect a chat ({total} total, page {page+1}):",
+                parse_mode=ParseMode.HTML, reply_markup=markup,
+            )
+        else:
+            await q.edit_message_text("ℹ️ No required chats left.")
+        return
+    try:
+        chat_id = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await q.answer("Invalid chat ID", show_alert=True)
+        return
+    entry = required_chats.find_one({"chat_id": chat_id})
+    if not entry:
+        await q.answer("Already removed", show_alert=True)
+        await q.edit_message_text("This chat has already been removed.")
+        return
+    if data.startswith("rm_pick:"):
+        await q.answer()
+        await q.edit_message_text(
+            f"⚠️ <b>CONFIRM REMOVAL</b>\n\n"
+            f"{esc(entry.get('name', chat_id))}\n"
+            f"<code>{chat_id}</code>\n\n"
+            "Isko force-join list se remove karna hai? Telegram group/channel delete nahi hoga.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"rm_yes:{chat_id}")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="rm_list:0"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="rm_cancel")],
+            ]),
+        )
+        return
+    if data.startswith("rm_yes:"):
+        # Delete only the selected required chat; a repeat click is harmless.
+        result = required_chats.delete_one({"chat_id": chat_id})
+        if result.deleted_count:
+            pending_requests.delete_many({"chat_id": chat_id})
+            membership_events.delete_many({"chat_id": chat_id})
+        await q.answer("Removed" if result.deleted_count else "Already removed")
+        await q.edit_message_text(
+            f"✅ <b>{esc(entry.get('name', chat_id))}</b> removed from required chats.\n"
+            "Existing video batches, users and other channels remain unchanged.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await q.answer("Unknown action", show_alert=True)
+
+
 async def admin_stats(update, context):
     total = users.count_documents({})
     verified = users.count_documents({"verified": True})
@@ -1173,6 +1282,8 @@ async def text_router(update, context):
             return await admin_add_group(update, context)
         if txt == "👥 Required Groups":
             return await admin_groups(update, context)
+        if txt == "🗑 Remove Required Channel":
+            return await admin_remove_chat_menu(update, context)
         if txt == "📊 Bot Stats":
             return await admin_stats(update, context)
         if txt == "❌ Cancel":
@@ -1238,6 +1349,7 @@ def main():
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
+    app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(
         CallbackQueryHandler(verify_join, pattern=r"^verify_join$")
     )

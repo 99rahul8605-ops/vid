@@ -227,3 +227,8 @@ case-insensitively before any numeric chat-ID parsing.
 
 So typing `cancel` inside `/setcustomlink` can no longer produce
 `Invalid numeric chat ID`.
+
+
+## Remove a required group/channel
+
+Open `/admin` → `🗑 Remove Required Channel` → select a chat → `✅ Yes, Remove`. The bot removes only the selected force-join requirement plus its temporary pending and membership-event data. The Telegram chat, uploads, user unlocks, and remaining required chats are untouched. The confirmation screen has Back and Cancel buttons.
