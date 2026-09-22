@@ -137,8 +137,24 @@ async def deletion_worker(app: Application):
 async def post_init(app: Application):
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
-    app.create_task(deletion_worker(app), name="video-cleanup")
+    # post_init runs before Application.start(), so Application.create_task()
+    # would not be tracked and can survive shutdown as a pending task.
+    # Own the task explicitly and cancel/await it in post_stop below.
+    app.bot_data["video_cleanup_task"] = asyncio.create_task(
+        deletion_worker(app), name="video-cleanup"
+    )
     log.info("Bot started as @%s", me.username)
+
+
+async def post_stop(app: Application):
+    task = app.bot_data.pop("video_cleanup_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    log.info("Video cleanup worker stopped")
 
 async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -880,7 +896,7 @@ async def admin_collect_video(update, context):
             chat_id=STORAGE_CHANNEL_ID,
             from_chat_id=update.effective_chat.id,
             message_id=update.message.message_id,
-            protect_content=True,
+            protect_content=False,  # storage copies remain unrestricted
         )
     except TelegramError as e:
         return await update.message.reply_text(
@@ -1338,6 +1354,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 

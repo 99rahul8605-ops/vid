@@ -232,3 +232,19 @@ So typing `cancel` inside `/setcustomlink` can no longer produce
 ## Remove a required group/channel
 
 Open `/admin` → `🗑 Remove Required Channel` → select a chat → `✅ Yes, Remove`. The bot removes only the selected force-join requirement plus its temporary pending and membership-event data. The Telegram chat, uploads, user unlocks, and remaining required chats are untouched. The confirmation screen has Back and Cancel buttons.
+
+## Clean shutdown fix
+
+The video deletion worker now starts via `asyncio.create_task` in `post_init` and is cancelled/awaited by `post_stop` on Ctrl+C. Pending deletion records remain in MongoDB and are picked up after restart.
+
+
+## Storage forwarding restriction fix
+
+New videos copied to the storage channel use `protect_content=False`. Copies delivered to users still use `protect_content=True`, and the 12-hour deletion worker is unchanged.
+
+**Important:** This only affects NEW storage copies. Telegram does not let this flag retroactively unprotect previously copied messages. If your existing storage messages are protected, re-upload from an unrestricted original source and rebuild their message-ID mappings using the admin upload workflow. If the storage channel itself has **Restrict Saving Content** enabled, disable that in the channel settings too; the bot cannot override the channel-level setting.
+
+
+## Faster storage upload
+
+Set `UPLOAD_CONCURRENCY=6` in `.env` (range 1–10). Copy calls run concurrently without uploading media bytes from the server. Telegram may still rate-limit requests. Send all videos and press `DONE`; bot waits for in-flight copies, sorts by incoming Telegram message ID, and then publishes 10-video batches in their original order. Each completed copy is promptly recorded in MongoDB. Storage copies are unrestricted, but user deliveries remain protected. Unfinished uploads interrupted by shutdown may need to be resent. Avoid simultaneously running multiple bot processes on the same MongoDB upload draft.
