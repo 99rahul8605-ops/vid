@@ -245,6 +245,14 @@ New videos copied to the storage channel use `protect_content=False`. Copies del
 **Important:** This only affects NEW storage copies. Telegram does not let this flag retroactively unprotect previously copied messages. If your existing storage messages are protected, re-upload from an unrestricted original source and rebuild their message-ID mappings using the admin upload workflow. If the storage channel itself has **Restrict Saving Content** enabled, disable that in the channel settings too; the bot cannot override the channel-level setting.
 
 
-## Faster storage upload
+## Storage copy retry and error diagnostics
 
-Set `UPLOAD_CONCURRENCY=6` in `.env` (range 1–10). Copy calls run concurrently without uploading media bytes from the server. Telegram may still rate-limit requests. Send all videos and press `DONE`; bot waits for in-flight copies, sorts by incoming Telegram message ID, and then publishes 10-video batches in their original order. Each completed copy is promptly recorded in MongoDB. Storage copies are unrestricted, but user deliveries remain protected. Unfinished uploads interrupted by shutdown may need to be resent. Avoid simultaneously running multiple bot processes on the same MongoDB upload draft.
+- Copying media to storage uses Telegram `copy_message` (no server-side download/upload).
+- Default three simultaneous copies; Telegram rate limits pause all workers.
+- Completed source/storage message mappings are stored in MongoDB before DONE.
+- DONE drains outstanding copies and reports failures by source message ID and safe error type.
+- Retry Failed retries only unsuccessful video IDs, without reuploading the first successful videos.
+- Publish Successful explicitly skips failed videos and publishes successes in their original source-message order.
+- For very large batches, reduce `UPLOAD_CONCURRENCY=2` if Telegram throttles.
+- On a network timeout, Telegram may have copied the video even if the response was lost; retries can leave extra copies in the storage channel.
+- When upgrading during an unfinished upload from an older version, complete the old version's DONE first so no draft is overwritten.

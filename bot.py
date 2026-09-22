@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError, RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,6 +32,8 @@ STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
 DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
+UPLOAD_CONCURRENCY = max(1, min(6, int(os.getenv("UPLOAD_CONCURRENCY", "3"))))
+UPLOAD_MAX_RETRIES = max(1, min(8, int(os.getenv("UPLOAD_MAX_RETRIES", "5"))))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +64,7 @@ pending_requests.create_index([("requested_at", ASCENDING)])
 membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
+UPLOAD_RUNTIME = {}
 
 USER_MENU = ReplyKeyboardMarkup(
     [
@@ -82,7 +85,7 @@ ADMIN_MENU = ReplyKeyboardMarkup(
 )
 
 UPLOAD_MENU = ReplyKeyboardMarkup(
-    [["DONE", "❌ Cancel"]],
+    [["DONE", "🔁 Retry Failed"], ["✅ Publish Successful", "❌ Cancel"]],
     resize_keyboard=True,
 )
 
@@ -147,6 +150,16 @@ async def post_init(app: Application):
 
 
 async def post_stop(app: Application):
+    # Do not leave upload-copy tasks dangling at shutdown. Completed transfers
+    # have already been saved to MongoDB; unfinished work remains in the draft.
+    runtime = UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    if runtime:
+        runtime["closing"] = True
+        running = list(runtime["tasks"])
+        for t in running:
+            t.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
     task = app.bot_data.pop("video_cleanup_task", None)
     if task is not None:
         task.cancel()
@@ -844,139 +857,236 @@ async def admin(update, context):
 async def admin_upload_start(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
+    runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
+    if runtime and not runtime["closing"]:
+        return await update.message.reply_text("Upload already running. Videos bhejo ya DONE dabao.", reply_markup=UPLOAD_MENU)
 
-    drafts.delete_one({"admin_id": ADMIN_ID})
-    drafts.insert_one(
-        {
-            "admin_id": ADMIN_ID,
-            "message_ids": [],
-            "uploaded": 0,
-            "created_at": utcnow(),
-        }
-    )
+    old = drafts.find_one({"admin_id": ADMIN_ID})
+    # Do not overwrite an old unfinished draft when updating the code.
+    if old and (old.get("copied") or old.get("message_ids") or old.get("failed")):
+        if old.get("message_ids") and not old.get("copied"):
+            return await update.message.reply_text(
+                "⚠️ Purane version ka unfinished draft mila hai. Existing uploads safe hain. "
+                "Pehle old version me DONE complete karo, phir naya upload start karo."
+            )
+        submitted = int(old.get("submitted", 0))
+        seen = {x["source_message_id"] for x in old.get("copied", [])}
+    else:
+        drafts.replace_one(
+            {"admin_id": ADMIN_ID},
+            {"admin_id": ADMIN_ID, "copied": [], "failed": [], "submitted": 0, "created_at": utcnow()},
+            upsert=True,
+        )
+        submitted, seen = 0, set()
+
+    UPLOAD_RUNTIME[ADMIN_ID] = {
+        "semaphore": asyncio.Semaphore(UPLOAD_CONCURRENCY),
+        "tasks": set(), "closing": False, "seen": seen,
+        "submitted": submitted, "cooldown_until": 0.0,
+    }
     ADMIN_STATE[ADMIN_ID] = "upload_videos"
-
     await update.message.reply_text(
-        "📤 <b>VIDEO UPLOAD MODE ON</b>\n\n"
-        "Ab jitne videos chaho send/forward karo — 100+, 500+ bhi.\n"
-        "Har video private storage channel me save hoga.\n"
-        "Har 10 videos automatically ek published batch ban jayega.\n\n"
-        "Jab sab upload ho jaye to <b>DONE</b> bhejo.\n"
-        "Last me 1–9 videos bachenge to unka bhi final partial batch publish hoga.",
+        "🚀 <b>STORAGE UPLOAD</b>\n\n"
+        f"Parallel copies: <b>{UPLOAD_CONCURRENCY}</b>\n"
+        "Telegram flood wait aaya to automatically wait + retry hoga. "
+        "Every successful storage copy MongoDB me save hoga. "
+        "DONE par errors report honge; failures ko Retry Failed se dobara try kar sakte ho.",
         parse_mode=ParseMode.HTML,
         reply_markup=UPLOAD_MENU,
     )
+
 
 async def publish_message_ids(mids):
     if not mids:
         return None
     number = next_batch_no()
-    batches.insert_one(
-        {
-            "batch_no": number,
-            "message_ids": list(mids),
-            "published": True,
-            "created_at": utcnow(),
-        }
-    )
+    batches.insert_one({
+        "batch_no": number,
+        "message_ids": list(mids),
+        "published": True,
+        "created_at": utcnow(),
+    })
     return number
 
-async def admin_collect_video(update, context):
-    if (
-        update.effective_user.id != ADMIN_ID
-        or ADMIN_STATE.get(ADMIN_ID) != "upload_videos"
-    ):
-        return
 
+def _safe_error(exc):
+    # Never echo HTTP URLs, bot tokens or credentials into admin messages/logs.
+    if isinstance(exc, RetryAfter):
+        return "RetryAfter"
+    if isinstance(exc, BadRequest):
+        detail = str(exc).replace(BOT_TOKEN, "[TOKEN]")
+        return ("BadRequest: " + detail)[:180]
+    if isinstance(exc, Forbidden):
+        return "Forbidden: bot lacks destination access or permissions"
+    return type(exc).__name__
+
+
+async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
+    async with runtime["semaphore"]:
+        reason = "Unknown"
+        for attempt in range(UPLOAD_MAX_RETRIES):
+            try:
+                # One bot-wide backoff gate: RetryAfter from one copy pauses
+                # the other workers too instead of triggering repeated floods.
+                sleep_for = runtime["cooldown_until"] - asyncio.get_running_loop().time()
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+                copied = await bot.copy_message(
+                    chat_id=STORAGE_CHANNEL_ID,
+                    from_chat_id=src_chat_id,
+                    message_id=source_id,
+                    protect_content=False,
+                    read_timeout=60,
+                    write_timeout=60,
+                    connect_timeout=20,
+                    pool_timeout=30,
+                )
+                drafts.update_one(
+                    {"admin_id": ADMIN_ID},
+                    {
+                        "$addToSet": {"copied": {
+                            "source_message_id": source_id,
+                            "storage_message_id": copied.message_id,
+                        }},
+                        "$pull": {"failed": {"source_message_id": source_id}},
+                    },
+                )
+                return
+            except RetryAfter as exc:
+                wait = float(exc.retry_after) + 1
+                runtime["cooldown_until"] = max(
+                    runtime["cooldown_until"],
+                    asyncio.get_running_loop().time() + wait,
+                )
+                reason = f"RetryAfter ({round(wait)}s)"
+                log.warning("Storage rate-limited. Telegram requires waiting %ss", round(wait))
+            except (TimedOut, NetworkError) as exc:
+                reason = type(exc).__name__
+                # Telegram may have copied a video before a request times out;
+                # retry can occasionally create a duplicate storage message.
+                if attempt + 1 < UPLOAD_MAX_RETRIES:
+                    await asyncio.sleep(min(2**attempt, 16))
+            except (BadRequest, Forbidden) as exc:
+                reason = _safe_error(exc)
+                log.warning("Storage copy source=%s: %s", source_id, reason)
+                break  # permanent error; retrying will not repair permissions
+            except TelegramError as exc:
+                reason = _safe_error(exc)
+                log.warning("Storage copy source=%s: %s", source_id, reason)
+                if attempt + 1 < UPLOAD_MAX_RETRIES:
+                    await asyncio.sleep(min(2**attempt, 16))
+            except asyncio.CancelledError:
+                raise
+        drafts.update_one(
+            {"admin_id": ADMIN_ID},
+            {"$pull": {"failed": {"source_message_id": source_id}}},
+        )
+        drafts.update_one(
+            {"admin_id": ADMIN_ID},
+            {"$addToSet": {"failed": {"source_message_id": source_id, "reason": reason}}},
+        )
+
+
+def _enqueue_upload(bot, runtime, chat_id, source_id):
+    t = asyncio.create_task(
+        _storage_copy_job(bot, runtime, chat_id, source_id),
+        name=f"copy-video-{source_id}",
+    )
+    runtime["tasks"].add(t)
+    t.add_done_callback(runtime["tasks"].discard)
+
+
+async def admin_collect_video(update, context):
+    if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "upload_videos":
+        return
     if not update.message.video:
         return
-
-    try:
-        copied = await context.bot.copy_message(
-            chat_id=STORAGE_CHANNEL_ID,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
-            protect_content=False,  # storage copies remain unrestricted
+    runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
+    if not runtime or runtime["closing"]:
+        return await update.message.reply_text("Upload closing hai. DONE process complete hone do.")
+    mid = update.message.message_id
+    if mid in runtime["seen"]:
+        return
+    runtime["seen"].add(mid)
+    runtime["submitted"] += 1
+    drafts.update_one({"admin_id": ADMIN_ID}, {"$inc": {"submitted": 1}})
+    _enqueue_upload(context.bot, runtime, update.effective_chat.id, mid)
+    n = runtime["submitted"]
+    if n == 1 or n % 10 == 0:
+        doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
+        await update.message.reply_text(
+            f"📤 Received: <b>{n}</b> | Copied: <b>{len(doc.get('copied', []))}</b> | "
+            f"Failed: <b>{len(doc.get('failed', []))}</b>",
+            parse_mode=ParseMode.HTML,
         )
-    except TelegramError as e:
-        return await update.message.reply_text(
-            f"❌ Storage copy failed: {type(e).__name__}"
-        )
 
-    draft = drafts.find_one({"admin_id": ADMIN_ID}) or {
-        "message_ids": [],
-        "uploaded": 0,
-    }
-    pending = list(draft.get("message_ids", []))
-    pending.append(copied.message_id)
-    uploaded = int(draft.get("uploaded", 0)) + 1
 
-    completed_batch = None
-    if len(pending) >= 10:
-        completed_batch = await publish_message_ids(pending[:10])
-        pending = pending[10:]
+async def _drain_upload(runtime):
+    if runtime and runtime["tasks"]:
+        await asyncio.gather(*list(runtime["tasks"]), return_exceptions=True)
 
-    drafts.update_one(
-        {"admin_id": ADMIN_ID},
-        {
-            "$set": {
-                "message_ids": pending,
-                "uploaded": uploaded,
-                "updated_at": utcnow(),
-            }
-        },
-        upsert=True,
+
+async def admin_retry_failed(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
+    doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
+    failed = doc.get("failed", [])
+    if not runtime or not failed:
+        return await update.message.reply_text("Retry karne ke liye failed videos nahi hain.")
+    runtime["closing"] = False
+    ADMIN_STATE[ADMIN_ID] = "upload_videos"
+    await update.message.reply_text(f"🔁 Retrying {len(failed)} failed videos…")
+    for entry in failed:
+        _enqueue_upload(context.bot, runtime, update.effective_chat.id, entry["source_message_id"])
+    await _drain_upload(runtime)
+    doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
+    await update.message.reply_text(
+        f"✅ Retry complete. Saved: {len(doc.get('copied', []))}; "
+        f"Still failed: {len(doc.get('failed', []))}. DONE dabao.",
+        reply_markup=UPLOAD_MENU,
     )
 
-    if completed_batch:
-        await update.message.reply_text(
-            f"✅ Uploaded: <b>{uploaded}</b>\n"
-            f"📦 Batch <b>{completed_batch}</b> auto-published (10 videos)\n"
-            f"⏳ Current partial batch: <b>{len(pending)}/10</b>",
+
+async def admin_upload_done(update, context, force_publish=False):
+    runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
+    doc = drafts.find_one({"admin_id": ADMIN_ID})
+    if not doc:
+        return await update.message.reply_text("No active upload session.", reply_markup=ADMIN_MENU)
+    if runtime:
+        runtime["closing"] = True
+    status = await update.message.reply_text("⏳ Copy jobs finish ho rahi hain…")
+    await _drain_upload(runtime)
+    doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
+    failed = doc.get("failed", [])
+    copied = sorted(doc.get("copied", []), key=lambda x: x["source_message_id"])
+    if failed and not force_publish:
+        details = "\n".join(
+            f"• Video message {x['source_message_id']}: {esc(x.get('reason', 'Unknown'))}"
+            for x in failed[:10]
+        )
+        return await status.edit_text(
+            f"⚠️ <b>{len(failed)} VIDEOS FAILED</b>\n\n{details}\n\n"
+            "🔁 Retry Failed dabao, phir DONE. Ya ✅ Publish Successful se failed skip karo.",
             parse_mode=ParseMode.HTML,
         )
-    elif uploaded == 1 or uploaded % 5 == 0:
-        await update.message.reply_text(
-            f"✅ Uploaded: <b>{uploaded}</b>\n"
-            f"⏳ Current partial batch: <b>{len(pending)}/10</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
-async def admin_upload_done(update, context):
-    draft = drafts.find_one({"admin_id": ADMIN_ID})
-    if not draft:
-        ADMIN_STATE.pop(ADMIN_ID, None)
-        return await update.message.reply_text(
-            "No active upload session.",
-            reply_markup=ADMIN_MENU,
-        )
-
-    remaining = list(draft.get("message_ids", []))
-    uploaded = int(draft.get("uploaded", 0))
-    final_batch = None
-    if remaining:
-        final_batch = await publish_message_ids(remaining)
-
+    # Publish only once; the draft is retained until all DB inserts succeed.
+    ids = [x["storage_message_id"] for x in copied]
+    published = []
+    for i in range(0, len(ids), 10):
+        published.append(await publish_message_ids(ids[i:i+10]))
     drafts.delete_one({"admin_id": ADMIN_ID})
     ADMIN_STATE.pop(ADMIN_ID, None)
-
-    text = (
-        "✅ <b>UPLOAD MODE CLOSED</b>\n\n"
-        f"🎞 Total uploaded this session: <b>{uploaded}</b>\n"
-        f"📦 Total published batches now: <b>{published_batch_count()}</b>\n"
-    )
-    if final_batch:
-        text += (
-            f"📦 Final partial batch: <b>{final_batch}</b> "
-            f"({len(remaining)} videos)\n"
-        )
-    text += "\nUpload mode is now OFF."
-
-    await update.message.reply_text(
-        text,
+    UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    await status.edit_text(
+        f"✅ <b>UPLOAD COMPLETE</b>\n\n"
+        f"Received: <b>{doc.get('submitted', 0)}</b>\n"
+        f"Saved: <b>{len(ids)}</b>\n"
+        f"Skipped failed: <b>{len(failed)}</b>\n"
+        f"Published batches: <b>{len(published)}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU,
     )
+    await update.message.reply_text("Admin menu", reply_markup=ADMIN_MENU)
 
 async def admin_add_group(update, context):
     if update.effective_user.id != ADMIN_ID:
@@ -1271,6 +1381,14 @@ async def admin_stats(update, context):
 async def cancel(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
+    runtime = UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    if runtime:
+        runtime["closing"] = True
+        running = list(runtime["tasks"])
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
     ADMIN_STATE.pop(ADMIN_ID, None)
     drafts.delete_one({"admin_id": ADMIN_ID})
     context.user_data.pop("custom_link_chat_id", None)
@@ -1287,6 +1405,10 @@ async def text_router(update, context):
         if await admin_group_flow(update, context):
             return
 
+        if txt == "🔁 Retry Failed":
+            return await admin_retry_failed(update, context)
+        if txt == "✅ Publish Successful":
+            return await admin_upload_done(update, context, force_publish=True)
         if ADMIN_STATE.get(ADMIN_ID) == "upload_videos" and txt.upper() == "DONE":
             return await admin_upload_done(update, context)
 
