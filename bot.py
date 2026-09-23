@@ -362,8 +362,8 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(
                 uid,
                 "🔒 <b>Access Locked Again</b>\n\n"
-                "Required group/channel membership chhodne ke baad access revoke ho gaya. "
-                "Dobara join/request karke verify karo.",
+                "You left a required group or channel, so your access has been revoked. "
+                "Join again or submit a new join request, then verify your membership.",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -479,10 +479,10 @@ async def show_join_gate(update, context, chats=None):
 
     text = (
         "🔐 <b>VIDEO ACCESS LOCKED</b>\n\n"
-        "Sirf neeche diye gaye remaining groups/channels complete karo.\n\n"
+        "Join the remaining required groups or channels listed below.\n\n"
         f"📌 Remaining: <b>{len(chats)}</b>\n"
-        "✅ Join/request complete karne ke baad <b>Verify</b> dabao.\n\n"
-        "ℹ️ Already completed groups dobara show nahi honge."
+        "✅ After joining or submitting your join requests, tap <b>Verify</b>.\n\n"
+        "ℹ️ Groups and channels you have already completed will not appear again."
     )
 
     await update.effective_chat.send_message(
@@ -540,7 +540,7 @@ async def home(update, context):
         f"👥 Successful referrals: <b>{refs}</b>\n"
         "🎞 Videos per full batch: <b>10</b>\n"
         f"⏳ Videos auto-delete in <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
-        "Menu se option choose karo.",
+        "Choose an option from the menu below.",
         parse_mode=ParseMode.HTML,
         reply_markup=USER_MENU,
     )
@@ -573,10 +573,10 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "❌ <b>VERIFICATION INCOMPLETE</b>\n\n"
-            "Ye joins/request abhi missing hain:\n"
+            "These required memberships or join requests are still missing:\n"
             f"{names}"
             f"{pending_text}\n\n"
-            "Sirf upar dikh rahe remaining chats complete karke dobara verify karo."
+            "Complete only the chats listed above, then try verifying again."
         )
         try:
             await q.edit_message_text(
@@ -627,13 +627,13 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     referrer,
                     "🎉 <b>REFERRAL SUCCESSFUL!</b>\n\n"
-                    "Referred user ne force-join verification complete kar liya.\n\n"
+                    "Your referred user has completed the required group and channel verification.\n\n"
                     f"👥 Verified referrals: <b>{current}</b>\n"
                     f"🎯 Next unlock target: <b>{need}</b>\n\n"
                     + (
-                        "✅ Next 10 ready hain — <b>Unlock Next 10</b> dabao."
+                        "✅ Your next 10 videos are ready. Tap <b>Unlock Next 10</b>."
                         if current >= need
-                        else "Invite progress continue karo."
+                        else "Keep inviting friends to reach your next unlock goal."
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=USER_MENU,
@@ -653,7 +653,7 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
         f"{pending_note}\n\n"
-        f"Videos protected rahenge aur <b>{DELETE_AFTER_HOURS} hours</b> baad delete ho jayenge."
+        f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>."
     )
     try:
         await q.edit_message_text(
@@ -688,7 +688,7 @@ async def ensure_verified(update, context):
     if missing:
         users.update_one({"user_id": uid}, {"$set": {"verified": False}})
         await update.effective_chat.send_message(
-            "🔒 <b>Access re-locked.</b>\nRequired membership/request missing hai.",
+            "🔒 <b>Access re-locked.</b>\nOne or more required memberships or join requests are missing.",
             parse_mode=ParseMode.HTML,
         )
         await show_join_gate(update, context)
@@ -699,7 +699,7 @@ async def send_batch(chat_id, batch_no, context):
     batch = batches.find_one({"batch_no": batch_no, "published": True})
     if not batch:
         return await context.bot.send_message(
-            chat_id, "⚠️ Ye batch available nahi hai."
+            chat_id, "⚠️ This video batch is currently unavailable."
         )
 
     mids = batch.get("message_ids", [])
@@ -750,7 +750,7 @@ async def send_batch(chat_id, batch_no, context):
         chat_id,
         "✅ <b>DELIVERY COMPLETE</b>\n\n"
         f"Sent: <b>{len(sent)}/{len(mids)}</b>\n"
-        "Next set ke liye <b>🔓 Unlock Next 10</b> use karo.",
+        "To get the next set, select <b>🔓 Unlock Next 10</b>.",
         parse_mode=ParseMode.HTML,
         reply_markup=USER_MENU,
     )
@@ -761,9 +761,9 @@ async def my_videos(update, context):
     d = user_doc(update.effective_user.id) or {}
     current = int(d.get("unlocked_batch", 0))
     if current <= 0:
-        return await update.message.reply_text("⚠️ Abhi koi batch unlocked nahi hai.")
+        return await update.message.reply_text("⚠️ You have not unlocked any video batches yet.")
     await update.message.reply_text(
-        f"🔁 Batch <b>{current}</b> resend kar raha hoon…",
+        f"🔁 Batch <b>{current}</b> is being sent again…",
         parse_mode=ParseMode.HTML,
     )
     await send_batch(update.effective_chat.id, current, context)
@@ -793,7 +793,7 @@ async def unlock_next(update, context):
             f"Required verified referrals: <b>{need}</b>\n"
             f"Successful referrals: <b>{have}</b>\n"
             f"Remaining: <b>{need-have}</b>\n\n"
-            "Referral tabhi count hoga jab friend required joins/approval requests complete karke verify kare.\n\n"
+            "A referral counts only after your friend completes all required memberships or join requests and passes verification.\n\n"
             f"🔗 <b>Your referral link:</b>\n<code>{esc(link)}</code>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -991,7 +991,7 @@ async def admin_upload_status(update, context):
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     doc = drafts.find_one({"admin_id": ADMIN_ID})
     if not runtime and not doc:
-        return await update.message.reply_text("ℹ️ Koi active upload nahi hai. 📤 Upload Videos dabao.")
+        return await update.message.reply_text("ℹ️ No upload is currently active. Select 📤 Upload Videos to begin.")
     text = _upload_progress_text(doc or {}, runtime)
     status = await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     if runtime and not runtime.get("progress_message_id"):
@@ -1007,9 +1007,9 @@ async def admin_upload_start(update, context):
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     if runtime:
         notice = (
-            "Upload finishing/review mode mein hai. Retry Failed ya Publish Successful use karo."
+            "The current upload is finishing or awaiting review. Choose Retry Failed or Publish Successful."
             if runtime["closing"]
-            else "Upload already running. Videos bhejo ya DONE dabao."
+            else "An upload is already in progress. Send more videos or select DONE."
         )
         return await update.message.reply_text(notice, reply_markup=UPLOAD_MENU)
 
@@ -1018,8 +1018,8 @@ async def admin_upload_start(update, context):
     if old and (old.get("copied") or old.get("message_ids") or old.get("failed")):
         if old.get("message_ids") and not old.get("copied"):
             return await update.message.reply_text(
-                "⚠️ Purane version ka unfinished draft mila hai. Existing uploads safe hain. "
-                "Pehle old version me DONE complete karo, phir naya upload start karo."
+                "⚠️ An unfinished draft from an older version was found. Your existing uploads are safe. "
+                "Finish the upload in the older version with DONE before starting a new upload."
             )
         submitted = int(old.get("submitted", 0))
         seen = {x["source_message_id"] for x in old.get("copied", [])}
@@ -1047,9 +1047,9 @@ async def admin_upload_start(update, context):
         "🚀 <b>STORAGE UPLOAD</b>\n\n"
         "Storage copy workers: <b>1 (sequential)</b>\n"
         f"Gap between copies: <b>{UPLOAD_COPY_GAP_SECONDS:g}s</b>\n"
-        "Telegram RetryAfter aaya to poori queue required time tak pause hogi. "
-        "Every successful storage copy MongoDB me save hoga. "
-        "DONE par errors report honge; failures ko Retry Failed se dobara try kar sakte ho.",
+        "If Telegram applies a rate limit, the entire queue will pause for the required period. "
+        "Every successful storage copy is saved to MongoDB. "
+        "Select DONE to review any errors. Use Retry Failed to try failed videos again.",
         parse_mode=ParseMode.HTML,
         reply_markup=UPLOAD_MENU,
     )
@@ -1202,7 +1202,7 @@ async def admin_collect_video(update, context):
         return
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     if not runtime or runtime["closing"]:
-        return await update.message.reply_text("Upload closing hai. DONE process complete hone do.")
+        return await update.message.reply_text("The upload is closing. Please allow the DONE process to finish.")
     mid = update.message.message_id
     if mid in runtime["seen"]:
         return
@@ -1226,7 +1226,7 @@ async def admin_retry_failed(update, context):
     doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
     failed = doc.get("failed", [])
     if not runtime or not failed:
-        return await update.message.reply_text("Retry karne ke liye failed videos nahi hain.")
+        return await update.message.reply_text("There are no failed videos to retry.")
     runtime["closing"] = False
     runtime["phase"] = "retrying"
     ADMIN_STATE[ADMIN_ID] = "upload_videos"
@@ -1238,7 +1238,7 @@ async def admin_retry_failed(update, context):
     runtime["phase"] = "review" if doc.get("failed") else "uploading"
     await update.message.reply_text(
         f"✅ Retry complete. Saved: {len(doc.get('copied', []))}; "
-        f"Still failed: {len(doc.get('failed', []))}. DONE dabao.",
+        f"Still failed: {len(doc.get('failed', []))}. Select DONE.",
         reply_markup=UPLOAD_MENU,
     )
 
@@ -1251,7 +1251,7 @@ async def admin_upload_done(update, context, force_publish=False):
     if runtime:
         runtime["closing"] = True
         runtime["phase"] = "finishing"
-    status = await update.message.reply_text("⏳ Copy jobs finish ho rahi hain… Live progress upar update hota rahega.")
+    status = await update.message.reply_text("⏳ Finishing storage copies… The live progress message above will keep updating.")
     await _drain_upload(runtime)
     doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
     failed = doc.get("failed", [])
@@ -1265,7 +1265,7 @@ async def admin_upload_done(update, context, force_publish=False):
         )
         return await status.edit_text(
             f"⚠️ <b>{len(failed)} VIDEOS FAILED</b>\n\n{details}\n\n"
-            "🔁 Retry Failed dabao, phir DONE. Ya ✅ Publish Successful se failed skip karo.",
+            "🔁 Select Retry Failed, then DONE. Or select ✅ Publish Successful to skip the failed videos.",
             parse_mode=ParseMode.HTML,
         )
     # Publish only once; the draft is retained until all DB inserts succeed.
@@ -1299,10 +1299,10 @@ async def admin_add_group(update, context):
     ADMIN_STATE[ADMIN_ID] = "group_chat_id"
     await update.message.reply_text(
         "➕ <b>ADD REQUIRED CHAT</b>\n\n"
-        "Numeric group/channel ID bhejo.\n"
+        "Send the numeric group or channel ID.\n"
         "Example: <code>-1001234567890</code>\n\n"
-        "Bot default se is chat ke liye <b>approval/join-request link</b> generate karega.\n"
-        "Bot ko chat me admin + invite rights chahiye.",
+        "The bot will automatically generate an <b>approval-required join link</b> for this chat.\n"
+        "The bot must be an administrator of this chat with permission to invite users.",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True),
     )
@@ -1336,8 +1336,8 @@ async def admin_group_flow(update, context):
             )
         except TelegramError as e:
             await update.message.reply_text(
-                "❌ Approval link generate nahi hua.\n"
-                "Bot ko target chat me admin + invite-user permission do.\n\n"
+                "❌ Could not generate the approval link.\n"
+                "Give the bot administrator access and permission to invite users in the target chat.\n\n"
                 f"Error: <code>{esc(type(e).__name__)}</code>",
                 parse_mode=ParseMode.HTML,
             )
@@ -1378,16 +1378,16 @@ async def admin_group_flow(update, context):
             await update.message.reply_text("Invalid numeric chat ID.")
             return True
         if not required_chats.find_one({"chat_id": cid}):
-            await update.message.reply_text("Ye required chat configured nahi hai.")
+            await update.message.reply_text("This required chat has not been configured.")
             return True
         context.user_data["custom_link_chat_id"] = cid
         ADMIN_STATE[ADMIN_ID] = "custom_link_url"
-        await update.message.reply_text("Ab custom t.me join/invite URL bhejo.")
+        await update.message.reply_text("Now send the custom t.me join or invite URL.")
         return True
 
     if st == "custom_link_url":
         if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
-            await update.message.reply_text("Valid Telegram t.me URL bhejo.")
+            await update.message.reply_text("Please send a valid Telegram t.me URL.")
             return True
         cid = context.user_data.pop("custom_link_chat_id")
         required_chats.update_one(
@@ -1414,7 +1414,7 @@ async def set_custom_link(update, context):
         return
     ADMIN_STATE[ADMIN_ID] = "custom_link_chat_id"
     await update.message.reply_text(
-        "🔗 Custom link set karne ke liye required chat ka numeric ID bhejo.",
+        "🔗 Send the numeric ID of the required chat whose custom link you want to set.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True),
     )
 
@@ -1442,7 +1442,7 @@ async def admin_groups(update, context):
             for x in rows
         )
         text += (
-            "\n\nCustom link chahiye to command use karo:\n"
+            "\n\nTo set a custom link, use this command:\n"
             "<code>/setcustomlink</code>"
         )
     else:
@@ -1485,12 +1485,12 @@ async def admin_remove_chat_menu(update, context):
         return
     markup, page, total = remove_chat_list_markup()
     if not markup:
-        await update.message.reply_text("ℹ️ Koi required group/channel configured nahi hai.", reply_markup=ADMIN_MENU)
+        await update.message.reply_text("ℹ️ No required groups or channels have been configured.", reply_markup=ADMIN_MENU)
         return
     await update.message.reply_text(
         f"🗑 <b>REMOVE REQUIRED CHANNEL</b>\n\n"
-        f"Konsa group/channel force-join se hatana hai? ({total} total)\n"
-        "Channel khud delete nahi hoga; sirf bot ki required list se hatega.",
+        f"Which group or channel would you like to remove from the required list? ({total} total)\n"
+        "The Telegram group or channel will not be deleted; only its entry in the required list will be removed.",
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
@@ -1533,7 +1533,7 @@ async def remove_chat_callback(update, context):
             f"⚠️ <b>CONFIRM REMOVAL</b>\n\n"
             f"{esc(entry.get('name', chat_id))}\n"
             f"<code>{chat_id}</code>\n\n"
-            "Isko force-join list se remove karna hai? Telegram group/channel delete nahi hoga.",
+            "Remove this chat from the required list? The Telegram group or channel itself will not be deleted.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"rm_yes:{chat_id}")],
