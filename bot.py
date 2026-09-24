@@ -551,7 +551,7 @@ async def post_stop(app: Application):
     log.info("Video cleanup worker stopped")
 
 
-async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _ensure_user_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     old = users.find_one({"user_id": u.id})
     if old:
@@ -590,6 +590,11 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     users.insert_one(doc)
     return doc
+
+
+async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # PyMongo is synchronous; keep database I/O away from Telegram's event loop.
+    return await asyncio.to_thread(_ensure_user_sync, update, context)
 
 
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -707,15 +712,18 @@ async def check_one_chat(bot, ch, uid):
             is_member = bool(getattr(member, "is_member", False))
 
         if is_member:
-            pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
-            membership_events.update_one(
-                {"chat_id": chat_id, "user_id": uid},
-                {"$set": {"is_member": True, "last_seen_member_at": utcnow(), "last_status": str(status)}},
-                upsert=True,
-            )
+            def save_member():
+                pending_requests.delete_many({"chat_id": chat_id, "user_id": uid})
+                membership_events.update_one(
+                    {"chat_id": chat_id, "user_id": uid},
+                    {"$set": {"is_member": True, "last_seen_member_at": utcnow(), "last_status": str(status)}},
+                    upsert=True,
+                )
+            await asyncio.to_thread(save_member)
             return ch, "member"
 
-        membership_events.update_one(
+        await asyncio.to_thread(
+            membership_events.update_one,
             {"chat_id": chat_id, "user_id": uid},
             {"$set": {"is_member": False, "last_seen_nonmember_at": utcnow(), "last_status": str(status)}},
             upsert=True,
@@ -731,7 +739,7 @@ async def check_one_chat(bot, ch, uid):
 
 
 async def membership_result(bot, uid):
-    chats = active_required_chats()
+    chats = await asyncio.to_thread(active_required_chats)
     if not chats:
         return chats, [], []
 
@@ -761,7 +769,7 @@ def join_keyboard(chats, hide_verified=False):
     return InlineKeyboardMarkup(rows)
 
 
-async def show_join_gate(update, context, chats=None):
+async def show_join_gate(update, context, chats=None, status_message=None):
     if chats is None:
         chats = active_required_chats()
     if not chats:
@@ -774,51 +782,111 @@ async def show_join_gate(update, context, chats=None):
         "✅ After joining or submitting your join requests, tap <b>Verify</b>.\n\n"
         "ℹ️ Groups and channels you have already completed will not appear again."
     )
+    if status_message:
+        return await status_message.edit_text(text, parse_mode=ParseMode.HTML,
+                                              reply_markup=join_keyboard(chats))
     await reply(update, context, text, reply_markup=join_keyboard(chats))
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_user(update, context)
-    uid = update.effective_user.id
-    chats, missing, pending = await membership_result(context.bot, uid)
-
-    if not missing:
+def _start_db_decision(uid, has_access):
+    """Small atomic-ish synchronous Mongo section executed outside event loop."""
+    if has_access:
         current = users.find_one({"user_id": uid}) or {}
-        set_data = {"verified": True, "verified_at": utcnow()}
+        fields = {"verified": True, "verified_at": utcnow()}
         if int(current.get("unlocked_batch", 0)) == 0 and published_batch_count() > 0:
-            set_data["unlocked_batch"] = 1
-        users.update_one({"user_id": uid}, {"$set": set_data})
-        return await home(update, context)
-
-    users.update_one({"user_id": uid}, {"$set": {"verified": False}})
-    await show_join_gate(update, context, chats=missing)
+            fields["unlocked_batch"] = 1
+    else:
+        fields = {"verified": False}
+    users.update_one({"user_id": uid}, {"$set": fields})
 
 
-async def home(update, context):
-    uid = update.effective_user.id
-    d = user_doc(uid) or {}
-    unlocked = int(d.get("unlocked_batch", 0))
-    total = published_batch_count()
-    refs = int(d.get("verified_referrals", 0))
-    if unlocked == 0 and d.get("verified") and total:
-        users.update_one(
-            {"user_id": uid},
-            {"$set": {"unlocked_batch": 1}},
-        )
-        unlocked = 1
-        d = user_doc(uid) or {}
+async def _animate_start_loading(status_message):
+    """Animate one status message; never send extra messages during /start."""
+    frames = (
+        "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
+        "⏳ <b>Loading your video vault</b>\n\n▰▰▱▱▱ Checking access…",
+        "⏳ <b>Loading your video vault</b>\n\n▰▰▰▱▱ Checking access…",
+        "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▱ Checking access…",
+        "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▰ Almost ready…",
+    )
+    index = 1  # The first frame is sent directly, before database work.
+    try:
+        while True:
+            await asyncio.sleep(1.6)  # Limit status edits to avoid Telegram flood limits.
+            try:
+                await status_message.edit_text(frames[index], parse_mode=ParseMode.HTML)
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
+            except BadRequest as exc:
+                if "not modified" not in str(exc).lower():
+                    log.debug("Start animation stopped: %s", exc)
+                    return
+            except TelegramError:
+                return
+            index = (index + 1) % len(frames)
+    except asyncio.CancelledError:
+        return
 
-    delete_hours = get_delete_hours()
-    await reply(
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # A visible loading bar is sent immediately; only one message is ever edited.
+    status = await reply(
         update, context,
+        "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
+    )
+    animation = asyncio.create_task(_animate_start_loading(status), name="start-loading")
+    try:
+        await ensure_user(update, context)
+        uid = update.effective_user.id
+        _, missing, _ = await membership_result(context.bot, uid)
+        await asyncio.to_thread(_start_db_decision, uid, not missing)
+        # Stop edits before replacing the animation with the actual user menu.
+        animation.cancel()
+        await asyncio.gather(animation, return_exceptions=True)
+        if missing:
+            await show_join_gate(update, context, chats=missing, status_message=status)
+        else:
+            await home(update, context, status_message=status)
+    except Exception:
+        log.exception("Start failed for user %s", update.effective_user.id)
+        animation.cancel()
+        await asyncio.gather(animation, return_exceptions=True)
+        try:
+            await status.edit_text("⚠️ Access check took too long. Please send /start again.")
+        except TelegramError:
+            pass
+    finally:
+        if not animation.done():
+            animation.cancel()
+            await asyncio.gather(animation, return_exceptions=True)
+
+
+def _home_snapshot(uid):
+    doc = user_doc(uid) or {}
+    unlocked = int(doc.get("unlocked_batch", 0))
+    total = published_batch_count()
+    refs = int(doc.get("verified_referrals", 0))
+    if unlocked == 0 and doc.get("verified") and total:
+        users.update_one({"user_id": uid}, {"$set": {"unlocked_batch": 1}})
+        unlocked = 1
+        doc = user_doc(uid) or {}
+    return unlocked, total, refs, get_delete_hours(), user_menu_inline(doc)
+
+
+async def home(update, context, status_message=None):
+    uid = update.effective_user.id
+    unlocked, total, refs, delete_hours, menu = await asyncio.to_thread(_home_snapshot, uid)
+    text = (
         "🎬 <b>VIDEO VAULT</b>\n\n"
         f"🔓 Unlocked batch: <b>{unlocked}/{total}</b>\n"
         f"👥 Successful referrals: <b>{refs}</b>\n"
         "🎞 Videos per full batch: <b>10</b>\n"
         f"⏳ Videos auto-delete in <b>{delete_hours} hour(s)</b>.\n\n"
-        "Choose an option:",
-        reply_markup=user_menu_inline(d),
+        "Choose an option:"
     )
+    if status_message:
+        return await status_message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=menu)
+    return await reply(update, context, text, reply_markup=menu)
 
 
 async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1992,7 +2060,7 @@ def main():
     app.add_handler(CommandHandler("resetverify", admin_reset_verify))
 
     # Public commands
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start, block=False))
     app.add_handler(CommandHandler("session", HV.session_start))
     app.add_handler(CommandHandler("cancel_session", HV.cancel_command))
 

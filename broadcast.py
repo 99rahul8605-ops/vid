@@ -173,22 +173,24 @@ class BroadcastManager:
     async def _send_loop(self, app, job_id):
         try:
             while True:
-                job = self.jobs.find_one({"job_id": job_id})
+                job = await asyncio.to_thread(self.jobs.find_one, {"job_id": job_id})
                 if not job or job["status"] != "sending":
                     return
                 # Small batches: no unbounded user-ID list held in RAM.
                 last_id = job.get("last_user_id", 0)
-                docs = list(self.users.find(self._audience_query(last_id),
-                                            {"user_id": 1}).sort("user_id", ASCENDING).limit(100))
+                docs = await asyncio.to_thread(
+                    lambda: list(self.users.find(self._audience_query(last_id),
+                                                 {"user_id": 1}).sort("user_id", ASCENDING).limit(100))
+                )
                 if not docs:
-                    self.jobs.update_one({"job_id": job_id, "status": "sending"},
+                    await asyncio.to_thread(self.jobs.update_one, {"job_id": job_id, "status": "sending"},
                                          {"$set": {"status": "completed", "updated_at": utcnow()}})
                     await self._edit_progress(app.bot, self.jobs.find_one({"job_id": job_id}))
                     await app.bot.send_message(self.admin_id, "✅ Broadcast completed.\n" +
                                                self.status_text_plain(job_id))
                     return
                 for doc in docs:
-                    job = self.jobs.find_one({"job_id": job_id})
+                    job = await asyncio.to_thread(self.jobs.find_one, {"job_id": job_id})
                     if not job or job["status"] != "sending":
                         return
                     uid = doc["user_id"]
@@ -207,11 +209,11 @@ class BroadcastManager:
                             LOG.info("Broadcast delivery to %s failed: %s", uid, type(e).__name__)
                             result = "failed"
                             break
-                    self.jobs.update_one({"job_id": job_id}, {
+                    await asyncio.to_thread(self.jobs.update_one, {"job_id": job_id}, {
                         "$inc": {result: 1},
                         "$set": {"last_user_id": uid, "updated_at": utcnow()},
                     })
-                    updated = self.jobs.find_one({"job_id": job_id})
+                    updated = await asyncio.to_thread(self.jobs.find_one, {"job_id": job_id})
                     if ((updated.get("sent", 0) + updated.get("failed", 0)) % 10 == 0):
                         await self._edit_progress(app.bot, updated)
                     await asyncio.sleep(self.interval)
@@ -219,7 +221,7 @@ class BroadcastManager:
             raise
         except Exception:
             LOG.exception("Broadcast interrupted")
-            self.jobs.update_one({"job_id": job_id, "status": "sending"},
+            await asyncio.to_thread(self.jobs.update_one, {"job_id": job_id, "status": "sending"},
                                  {"$set": {"status": "paused", "updated_at": utcnow()}})
             try:
                 await app.bot.send_message(self.admin_id,
