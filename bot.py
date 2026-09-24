@@ -451,9 +451,6 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ADMIN_STATE.pop(ADMIN_ID, None)
         return False
 
-    # Save the actual formatting from Telegram's rich-text editor instead
-    # of requiring the admin to write HTML/Markdown. The external message
-    # consumers already render these setting values as Telegram HTML.
     raw = update.message.text or ""
     if not raw.strip():
         await update.message.reply_text("⚠️ Value cannot be empty. Send new value or /cancel.")
@@ -470,15 +467,11 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return True
         value = str(hours)
     elif key.endswith("_button_text"):
-        # Telegram button labels are plain text. Do not save HTML tags in them.
         value = raw.strip()
         if len(value) > 100 or "\n" in value:
             await update.message.reply_text("⚠️ Button labels must be one line, up to 100 characters.")
             return True
     else:
-        # Message.text_html encodes real Telegram text entities (bold, italic,
-        # underline, strikethrough, code, links, spoiler, etc.) and escapes
-        # literal angle brackets. The user's line breaks are retained.
         value = update.message.text_html if update.message.entities else html.escape(raw)
         if len(raw) > 4000:
             await update.message.reply_text("⚠️ Keep the message under 4000 characters.")
@@ -591,7 +584,6 @@ async def post_stop(app: Application):
             pass
 
     await BROADCAST.shutdown()
-    # Clean up all in-flight HV sessions
     await HV.cleanup_all()
     log.info("Video cleanup worker stopped")
 
@@ -638,7 +630,6 @@ def _ensure_user_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # PyMongo is synchronous; keep database I/O away from Telegram's event loop.
     return await asyncio.to_thread(_ensure_user_sync, update, context)
 
 
@@ -834,7 +825,6 @@ async def show_join_gate(update, context, chats=None, status_message=None):
 
 
 def _start_db_decision(uid, has_access):
-    """Small atomic-ish synchronous Mongo section executed outside event loop."""
     if has_access:
         current = users.find_one({"user_id": uid}) or {}
         fields = {"verified": True, "verified_at": utcnow()}
@@ -846,7 +836,6 @@ def _start_db_decision(uid, has_access):
 
 
 async def _animate_start_loading(status_message):
-    """Animate one status message; never send extra messages during /start."""
     frames = (
         "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
         "⏳ <b>Loading your video vault</b>\n\n▰▰▱▱▱ Checking access…",
@@ -854,10 +843,10 @@ async def _animate_start_loading(status_message):
         "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▱ Checking access…",
         "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▰ Almost ready…",
     )
-    index = 1  # The first frame is sent directly, before database work.
+    index = 1
     try:
         while True:
-            await asyncio.sleep(1.6)  # Limit status edits to avoid Telegram flood limits.
+            await asyncio.sleep(1.6)
             try:
                 await status_message.edit_text(frames[index], parse_mode=ParseMode.HTML)
             except RetryAfter as exc:
@@ -874,7 +863,6 @@ async def _animate_start_loading(status_message):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # A visible loading bar is sent immediately; only one message is ever edited.
     status = await reply(
         update, context,
         "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
@@ -885,7 +873,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         _, missing, _ = await membership_result(context.bot, uid)
         await asyncio.to_thread(_start_db_decision, uid, not missing)
-        # Stop edits before replacing the animation with the actual user menu.
         animation.cancel()
         await asyncio.gather(animation, return_exceptions=True)
         if missing:
@@ -1022,7 +1009,6 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Verification is running…")
 
@@ -1105,7 +1091,6 @@ async def my_videos(update, context):
 
 
 async def see_videos_from_hv(update, context):
-    """Called from '📚 See Videos' button after human verification."""
     if not await ensure_verified(update, context):
         return
     uid = update.effective_user.id
@@ -1978,9 +1963,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await progress(update, context)
     if data == "um_verify_robot":
-        d = user_doc(uid) or {}
-        if d.get("human_verified"):
-            return await q.answer("✅ You are already verified.", show_alert=True)
+        # Unlimited verification — user can verify as many times as they want.
         await q.answer()
         return await HV.session_start(update, context)
     if data == "um_see_videos":
