@@ -1,4 +1,4 @@
-"""Opt-in announcement broadcasts for existing Telegram bot subscribers.
+"""Admin broadcasts for eligible existing Telegram bot users.
 
 One broadcast runs at a time, sequential delivery with Telegram RetryAfter support.
 Progress is persisted in MongoDB; resume manually after restarting the bot.
@@ -29,7 +29,6 @@ class BroadcastManager:
         self.admin_id = admin_id
         self.jobs = db.broadcast_jobs
         self.jobs.create_index([("created_at", DESCENDING)])
-        self.users.create_index([("broadcast_opt_in", ASCENDING)])
         self.drafts = {}
         self.task = None
         self.interval = max(1.5, float(os.getenv("BROADCAST_DELAY_SECONDS", "2")))
@@ -47,9 +46,17 @@ class BroadcastManager:
     @staticmethod
     def _confirm():
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Send to Subscribers", callback_data="bc_send"),
+            InlineKeyboardButton("✅ Send Broadcast", callback_data="bc_send"),
             InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel"),
         ]])
+
+    @staticmethod
+    def _audience_query(after_id=None):
+        """Target every user document stored in the bot users collection."""
+        query = {}
+        if after_id is not None:
+            query["user_id"] = {"$gt": after_id}
+        return query
 
     def _current(self):
         return self.jobs.find_one(sort=[("created_at", DESCENDING)])
@@ -61,29 +68,17 @@ class BroadcastManager:
         if update.effective_user.id != self.admin_id:
             return
         target = update.effective_chat.id
-        count = self.users.count_documents({"broadcast_opt_in": True})
+        count = self.users.count_documents(self._audience_query())
         await context.bot.send_message(
             target,
-            f"📣 <b>BROADCAST PANEL</b>\n\nSubscribed users: <b>{count}</b>\n"
+            f"📣 <b>BROADCAST PANEL</b>\n\nEligible bot users: <b>{count}</b>\n"
             f"Delay: <b>{self.interval:g}s</b> per recipient.\n"
-            "Only users who subscribe will receive announcements.",
+            "All stored bot users will be attempted.",
             parse_mode=ParseMode.HTML, reply_markup=self._menu(),
         )
 
     async def command(self, update, context):
         return await self.menu(update, context)
-
-    async def subscribe(self, update, context):
-        uid = update.effective_user.id
-        self.users.update_one({"user_id": uid}, {"$set": {"broadcast_opt_in": True}})
-        await context.bot.send_message(update.effective_chat.id,
-            "✅ You have subscribed to video-bot announcements. Send /unsubscribe to stop them.")
-
-    async def unsubscribe(self, update, context):
-        uid = update.effective_user.id
-        self.users.update_one({"user_id": uid}, {"$set": {"broadcast_opt_in": False}})
-        await context.bot.send_message(update.effective_chat.id,
-            "✅ Announcements disabled. Send /subscribe if you want them again.")
 
     async def collect(self, update, context):
         uid = update.effective_user.id
@@ -110,7 +105,7 @@ class BroadcastManager:
                 return await q.message.reply_text("Pause and finish the existing broadcast first.")
             self.drafts[self.admin_id] = "waiting"
             return await q.message.reply_text(
-                "📣 Send your announcement now (text, photo, video, document, etc.).\n"
+                "📣 Send the message to broadcast (text, photo, video, document, etc.).\n"
                 "You will see a preview before sending.")
         if op == "bc_cancel":
             self.drafts.pop(self.admin_id, None)
@@ -126,9 +121,9 @@ class BroadcastManager:
                 return await q.message.reply_text("An existing broadcast must finish first.")
             self.drafts.pop(self.admin_id, None)
             job_id = uuid4().hex
-            audience = self.users.count_documents({"broadcast_opt_in": True})
+            audience = self.users.count_documents(self._audience_query())
             if not audience:
-                return await q.message.reply_text("No subscribed users yet. Invite them to use /subscribe.")
+                return await q.message.reply_text("No eligible bot users found.")
             self.jobs.insert_one({
                 "job_id": job_id, "status": "sending", "source_chat_id": draft["chat_id"],
                 "source_message_id": draft["message_id"], "created_at": utcnow(),
@@ -136,7 +131,7 @@ class BroadcastManager:
                 "skipped": 0, "last_user_id": 0, "failures": [],
             })
             status = await q.message.reply_text(
-                f"🚀 Broadcast started for {audience} subscribed users.\n"
+                f"🚀 Broadcast started for {audience} eligible users.\n"
                 "Use /broadcast to see progress and pause or resume.")
             self.jobs.update_one({"job_id": job_id}, {"$set": {
                 "progress_chat_id": status.chat_id, "progress_message_id": status.message_id}})
@@ -166,10 +161,10 @@ class BroadcastManager:
             return "ℹ️ No previous broadcast."
         return ("📊 <b>BROADCAST STATUS</b>\n\n"
                 f"State: <b>{html.escape(job['status'])}</b>\n"
-                f"Subscribers at start: <b>{job.get('total_at_start', 0)}</b>\n"
+                f"Eligible users at start: <b>{job.get('total_at_start', 0)}</b>\n"
                 f"✅ Sent: <b>{job.get('sent', 0)}</b>\n"
                 f"❌ Failed: <b>{job.get('failed', 0)}</b>\n"
-                f"⏭ Skipped/unsubscribed: <b>{job.get('skipped', 0)}</b>\n"
+                f"⏭ Skipped: <b>{job.get('skipped', 0)}</b>\n"
                 f"Last recipient ID: <code>{job.get('last_user_id', 0)}</code>")
 
     def _start(self, app, job_id):
@@ -183,8 +178,7 @@ class BroadcastManager:
                     return
                 # Small batches: no unbounded user-ID list held in RAM.
                 last_id = job.get("last_user_id", 0)
-                docs = list(self.users.find({"user_id": {"$gt": last_id},
-                                             "broadcast_opt_in": True},
+                docs = list(self.users.find(self._audience_query(last_id),
                                             {"user_id": 1}).sort("user_id", ASCENDING).limit(100))
                 if not docs:
                     self.jobs.update_one({"job_id": job_id, "status": "sending"},
@@ -198,10 +192,6 @@ class BroadcastManager:
                     if not job or job["status"] != "sending":
                         return
                     uid = doc["user_id"]
-                    if not self.users.find_one({"user_id": uid, "broadcast_opt_in": True}):
-                        self.jobs.update_one({"job_id": job_id}, {"$inc": {"skipped": 1},
-                            "$set": {"last_user_id": uid, "updated_at": utcnow()}})
-                        continue
                     result = "sent"
                     while True:
                         if self.jobs.find_one({"job_id": job_id})["status"] != "sending":
@@ -245,7 +235,7 @@ class BroadcastManager:
                 f"✅ Sent: <b>{job.get('sent', 0)}</b>\n"
                 f"❌ Failed: <b>{job.get('failed', 0)}</b>\n"
                 f"⏭ Skipped: <b>{job.get('skipped', 0)}</b>\n"
-                f"Subscribed at start: <b>{job.get('total_at_start', 0)}</b>")
+                f"Eligible at start: <b>{job.get('total_at_start', 0)}</b>")
         try:
             await bot.edit_message_text(chat_id=job["progress_chat_id"],
                 message_id=job["progress_message_id"], text=text, parse_mode=ParseMode.HTML)

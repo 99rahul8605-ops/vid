@@ -191,8 +191,7 @@ def user_menu_inline(doc=None):
         InlineKeyboardButton("👥 My Referral", callback_data="um_ref"),
         InlineKeyboardButton("📊 My Progress", callback_data="um_progress"),
     ]
-    row3 = [InlineKeyboardButton("📣 Announcements", callback_data="um_news")]
-    return InlineKeyboardMarkup([row1, row_mid, row2, row3])
+    return InlineKeyboardMarkup([row1, row_mid, row2])
 
 
 def delivery_complete_inline():
@@ -325,7 +324,7 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/admin</code> — Open admin control panel\n"
     "• <code>/help</code> — Show this help panel\n"
-    "• <code>/broadcast</code> — Broadcast announcements to opted-in users\n"
+    "• <code>/broadcast</code> — Send a broadcast to eligible bot users\n"
     "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
@@ -1872,23 +1871,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "um_progress":
         await q.answer()
         return await progress(update, context)
-    if data == "um_news":
-        await q.answer()
-        enabled = bool((user_doc(uid) or {}).get("broadcast_opt_in"))
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Subscribe" if not enabled else "❌ Unsubscribe",
-                                 callback_data="um_news_toggle")]])
-        return await context.bot.send_message(q.message.chat_id,
-            "📣 <b>ANNOUNCEMENTS</b>\n\n"
-            + ("You are currently subscribed." if enabled else "Subscribe to receive video-bot announcements."),
-            parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    if data == "um_news_toggle":
-        await q.answer()
-        enabled = bool((user_doc(uid) or {}).get("broadcast_opt_in"))
-        users.update_one({"user_id": uid}, {"$set": {"broadcast_opt_in": not enabled}})
-        return await q.edit_message_text(
-            "✅ Announcements enabled. Use /unsubscribe to stop." if not enabled
-            else "✅ Announcements disabled. Use /subscribe to enable again.")
     if data == "um_verify_robot":
         d = user_doc(uid) or {}
         if d.get("human_verified"):
@@ -2003,9 +1985,6 @@ def main():
     # Owner commands
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("broadcast", BROADCAST.command))
-    app.add_handler(CommandHandler("subscribe", BROADCAST.subscribe))
-    app.add_handler(CommandHandler("unsubscribe", BROADCAST.unsubscribe))
-    app.add_handler(CommandHandler("stopbroadcast", BROADCAST.unsubscribe))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
@@ -2022,7 +2001,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(
         menu_callback,
-        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos|news|news_toggle)|am_(upload|batches|addgroup|groups|remove|stats|set|help|broadcast)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help|broadcast)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
     ))
     app.add_handler(CallbackQueryHandler(set_edit_callback, pattern=r"^set_edit:"))
     app.add_handler(CallbackQueryHandler(set_cancel_callback, pattern=r"^set_cancel$"))
