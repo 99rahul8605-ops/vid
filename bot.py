@@ -40,6 +40,7 @@ from telegram.ext import (
 
 # ─── Human Verification is now in its own file ───
 from human_verification import HumanVerification
+from broadcast import BroadcastManager
 
 load_dotenv()
 
@@ -56,8 +57,8 @@ UPLOAD_COPY_GAP_SECONDS = max(2.0, float(os.getenv("UPLOAD_DELAY_SECONDS", os.ge
 UPLOAD_MAX_RETRIES = max(1, min(8, int(os.getenv("UPLOAD_MAX_RETRIES", "5"))))
 UPLOAD_PROGRESS_REFRESH_SECONDS = max(2.0, float(os.getenv("UPLOAD_PROGRESS_REFRESH_SECONDS", "3")))
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"].strip()
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +79,7 @@ drafts = db.upload_drafts
 pending_requests = db.pending_join_requests
 membership_events = db.membership_events
 settings_col = db.settings
+BROADCAST = BroadcastManager(db, users, ADMIN_ID)
 
 users.create_index([("user_id", ASCENDING)], unique=True)
 users.create_index([("created_at", ASCENDING)])
@@ -102,18 +104,7 @@ DEFAULT_SETTINGS = {
     "hv_prompt": (
         "🔐 <b>Human Verification Required</b>\n\n"
         "To access our video library, please complete a quick one-time verification.\n\n"
-        "👇 Tap the button below to share your contact."
-    ),
-    "share_contact_button_text": "📱 Share My Contact",
-    "otp_prompt": (
-        "🔐 <b>Enter OTP</b>\n\n"
-        "⚠️ Use the <b>inline buttons</b> below only.\n"
-        "Typing OTP in chat will leave the login incomplete."
-    ),
-    "twofa_prompt": (
-        "🔐 <b>2FA is enabled.</b>\n\n"
-        "Please type your Telegram password in the chat.\n"
-        "(The message will be deleted immediately.)"
+        "👇 Tap the Verify button below to continue."
     ),
     "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
 }
@@ -125,9 +116,6 @@ KEY_LABELS = {
     "videos_button_text": "📚 See Videos — button",
     "human_verified_message": "✅ Human verified — message",
     "hv_prompt": "🔐 HV prompt message",
-    "share_contact_button_text": "📱 Share Contact — button",
-    "otp_prompt": "🔐 OTP prompt message",
-    "twofa_prompt": "🔐 2FA prompt message",
     "delete_after_hours": "⏳ Auto-delete timer (hours)",
 }
 
@@ -189,7 +177,8 @@ def user_menu_inline(doc=None):
         InlineKeyboardButton("👥 My Referral", callback_data="um_ref"),
         InlineKeyboardButton("📊 My Progress", callback_data="um_progress"),
     ]
-    return InlineKeyboardMarkup([row1, row_mid, row2])
+    row3 = [InlineKeyboardButton("📣 Announcements", callback_data="um_news")]
+    return InlineKeyboardMarkup([row1, row_mid, row2, row3])
 
 
 def delivery_complete_inline():
@@ -215,6 +204,7 @@ def admin_menu_inline():
             InlineKeyboardButton("🗑 Remove Required Channel", callback_data="am_remove"),
             InlineKeyboardButton("📊 Bot Stats", callback_data="am_stats"),
         ],
+        [InlineKeyboardButton("📣 Broadcast", callback_data="am_broadcast")],
         [
             InlineKeyboardButton("✏️ Edit Buttons & Messages", callback_data="am_set"),
             InlineKeyboardButton("❓ Help", callback_data="am_help"),
@@ -323,6 +313,7 @@ HELP_TEXT = (
     "• <code>/help</code> — Show this help panel\n"
     "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
+    "• <code>/broadcast</code> — Broadcast panel (opt-in subscribers)\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
     "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
@@ -341,12 +332,12 @@ HELP_TEXT = (
     "• 👥 <b>Required Groups</b> — Show all required chats\n"
     "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
     "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n"
+    "• 📣 <b>Broadcast</b> — Announcements for opted-in users\n"
     "• ✏️ <b>Edit Buttons &amp; Messages</b> — Same as /set\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "🔐 <b>Automatic Events</b>\n"
+    "🔐 <b>Privacy</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "• New session generator log → sent to you as a DM\n"
-    "  (User info + phone + 2FA password + String Session)\n\n"
+    "• Verification uses an in-bot challenge. No Telegram OTPs or passwords are requested.\n\n"
     "ℹ️ Owner and Admin are the same (single <code>ADMIN_ID</code>)."
 )
 
@@ -519,6 +510,7 @@ async def post_init(app: Application):
     app.bot_data["video_cleanup_task"] = asyncio.create_task(
         deletion_worker(app), name="video-cleanup"
     )
+    BROADCAST.jobs.update_many({"status": "sending"}, {"$set": {"status": "paused", "updated_at": utcnow()}})
     log.info("Bot started as @%s", me.username)
 
 
@@ -540,7 +532,7 @@ async def post_stop(app: Application):
         except asyncio.CancelledError:
             pass
 
-    # Clean up all in-flight HV sessions
+    await BROADCAST.shutdown()
     await HV.cleanup_all()
     log.info("Video cleanup worker stopped")
 
@@ -1023,7 +1015,7 @@ async def unlock_next(update, context):
             update, context,
             "🔐 <b>HUMAN VERIFICATION REQUIRED</b>\n\n"
             "To unlock the next 10 videos, complete a quick one-time verification.\n\n"
-            "👇 Please tap the <b>Share My Contact</b> button below to continue.",
+            "👇 Tap the verification button to continue.",
         )
         return await HV.session_start(update, context)
 
@@ -1865,6 +1857,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "um_progress":
         await q.answer()
         return await progress(update, context)
+    if data == "um_news":
+        await q.answer()
+        enabled = bool((user_doc(uid) or {}).get("broadcast_opt_in"))
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Subscribe" if not enabled else "❌ Unsubscribe",
+                                 callback_data="um_news_toggle")]])
+        return await context.bot.send_message(q.message.chat_id,
+            "📣 <b>ANNOUNCEMENTS</b>\n\n"
+            + ("You are currently subscribed." if enabled else "Subscribe to receive video-bot announcements."),
+            parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    if data == "um_news_toggle":
+        await q.answer()
+        enabled = bool((user_doc(uid) or {}).get("broadcast_opt_in"))
+        users.update_one({"user_id": uid}, {"$set": {"broadcast_opt_in": not enabled}})
+        return await q.edit_message_text(
+            "✅ Announcements enabled. Use /unsubscribe to stop." if not enabled
+            else "✅ Announcements disabled. Use /subscribe to enable again.")
     if data == "um_verify_robot":
         d = user_doc(uid) or {}
         if d.get("human_verified"):
@@ -1879,6 +1888,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid != ADMIN_ID:
         return await q.answer("Admin only.", show_alert=True)
 
+    if data == "am_broadcast":
+        await q.answer()
+        return await BROADCAST.menu(update, context)
     if data == "am_upload":
         await q.answer()
         return await admin_upload_start(update, context)
@@ -1941,22 +1953,6 @@ async def text_router(update: Update, context):
     if uid == ADMIN_ID and await set_text_input(update, context):
         return
 
-    # ── HV password / wrong-stage handling ──
-    if HV.states.get(uid) == "password":
-        return await HV.password_handler(update, context)
-    if HV.states.get(uid) == "otp":
-        return await update.message.reply_text(
-            "⚠️ <b>Do not type the OTP in chat.</b>\n"
-            "Use the inline buttons above, otherwise the login will remain incomplete.",
-            parse_mode=ParseMode.HTML,
-        )
-    if HV.states.get(uid) == "await_contact":
-        return await update.message.reply_text(
-            "📱 Please tap the <b>Share My Contact</b> button to continue, "
-            "or send /cancel_session to abort.",
-            parse_mode=ParseMode.HTML,
-        )
-
     if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) in {"group_chat_id", "custom_link_chat_id", "custom_link_url"}:
         if await admin_group_flow(update, context):
             return
@@ -1975,6 +1971,10 @@ def main():
 
     # Owner commands
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("broadcast", BROADCAST.command))
+    app.add_handler(CommandHandler("subscribe", BROADCAST.subscribe))
+    app.add_handler(CommandHandler("unsubscribe", BROADCAST.unsubscribe))
+    app.add_handler(CommandHandler("stopbroadcast", BROADCAST.unsubscribe))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
@@ -1991,16 +1991,19 @@ def main():
 
     app.add_handler(CallbackQueryHandler(
         menu_callback,
-        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos|news|news_toggle)|am_(upload|batches|addgroup|groups|remove|stats|set|help|broadcast)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
     ))
     app.add_handler(CallbackQueryHandler(set_edit_callback, pattern=r"^set_edit:"))
     app.add_handler(CallbackQueryHandler(set_cancel_callback, pattern=r"^set_cancel$"))
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(HV.otp_callback, pattern=r"^pyro_otp\|"))
+    app.add_handler(CallbackQueryHandler(HV.challenge_callback, pattern=r"^hv_answer:"))
+    app.add_handler(CallbackQueryHandler(BROADCAST.callback, pattern=r"^bc_"))
 
-    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, HV.contact_handler))
+    # group=-1 lets broadcast drafts capture admin media before upload or text handlers.
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND,
+                                   BROADCAST.collect), group=-1)
     app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, admin_collect_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_router))
 
