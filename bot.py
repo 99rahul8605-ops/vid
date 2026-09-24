@@ -655,6 +655,11 @@ async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_id=API_ID,
         api_hash=API_HASH,
         in_memory=True,
+        device_model="Samsung Galaxy S24 Ultra",
+        system_version="SDK 34",
+        app_version="11.5.3",
+        lang_code="en",
+        system_lang_code="en-US",
     )
 
     try:
