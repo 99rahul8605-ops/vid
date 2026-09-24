@@ -659,7 +659,7 @@ async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         system_version="SDK 34",
         app_version="11.5.3",
         lang_code="en",
-        system_lang_code="en-US",
+        
     )
 
     try:
