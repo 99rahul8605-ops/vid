@@ -162,6 +162,12 @@ def set_setting(key: str, value: str, admin_id: int = None):
 
 # ─────────────────── INLINE MENUS ───────────────────
 def user_menu_inline(doc=None):
+    """
+    User menu layout:
+      Row 1 (2 btns)  : 🎬 My Videos        🔓 Unlock Next 10   (Unlock hidden if 0 batches)
+      Row 2 (1 btn)   : 🤖 Verify as not robot
+      Row 3 (2 btns)  : 👥 My Referral      📊 My Progress
+    """
     if doc is None:
         doc = {}
     unlocked = int(doc.get("unlocked_batch", 0))
@@ -176,11 +182,15 @@ def user_menu_inline(doc=None):
             InlineKeyboardButton("🎬 My Videos", callback_data="um_videos"),
         ]
 
+    robot_btn = get_setting("verify_robot_button_text")
+    row_mid = [
+        InlineKeyboardButton(robot_btn, callback_data="um_verify_robot"),
+    ]
     row2 = [
         InlineKeyboardButton("👥 My Referral", callback_data="um_ref"),
         InlineKeyboardButton("📊 My Progress", callback_data="um_progress"),
     ]
-    return InlineKeyboardMarkup([row1, row2])
+    return InlineKeyboardMarkup([row1, row_mid, row2])
 
 
 def delivery_complete_inline():
@@ -1209,40 +1219,20 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending_note = f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>" if pending else ""
 
-    # ── If user hasn't done human verification yet → show "Verify as not robot" ──
-    human_verified = bool(fresh.get("human_verified"))
-    if not human_verified:
-        success_text = (
-            "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
-            "You have joined all required channels."
-            f"{pending_note}\n\n"
-            "🔐 <b>One last step:</b> please verify that you are not a robot."
-        )
-        robot_btn_text = get_setting("verify_robot_button_text")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(robot_btn_text, callback_data="um_verify_robot")]
-        ])
-        try:
-            await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except BadRequest:
-            try:
-                await q.edit_message_reply_markup(reply_markup=kb)
-            except BadRequest:
-                pass
-        return
-
-    # ── Already human-verified → normal success + user menu ──
+    # ── Always show user menu (with Verify-as-not-robot in middle row) ──
     success_text = (
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
         f"{pending_note}\n\n"
-        f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>."
+        f"Videos are protected and will be automatically deleted after <b>{DELETE_AFTER_HOURS} hours</b>.\n\n"
+        "Choose an option:"
     )
+    kb = menu_for(uid)
     try:
-        await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=None)
+        await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except BadRequest:
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            await q.edit_message_reply_markup(reply_markup=kb)
         except BadRequest:
             pass
 
@@ -1335,7 +1325,7 @@ async def my_videos(update, context):
 
 
 async def unlock_next(update, context):
-    """Unlock Next 10 — pure referral based (no human verification gate)."""
+    """Unlock Next 10 — pure referral based."""
     if not await ensure_verified(update, context):
         return
 
@@ -2196,6 +2186,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await progress(update, context)
     if data == "um_verify_robot":
+        d = user_doc(uid) or {}
+        if d.get("human_verified"):
+            return await q.answer("✅ You are already verified.", show_alert=True)
         await q.answer()
         return await pyro_session_start(update, context)
     if data == "um_see_videos":
