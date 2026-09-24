@@ -89,9 +89,19 @@ class BroadcastManager:
             await m.reply_text("Send text, photo, video, document, animation, audio or voice.")
             raise ApplicationHandlerStop
         self.drafts[uid] = {"chat_id": m.chat_id, "message_id": m.message_id}
+        if m.text is not None:
+            # Retain Telegram bold/italic/links while disabling web previews.
+            self.drafts[uid]["text_html"] = m.text_html
         await m.reply_text("📋 Broadcast preview:")
-        await context.bot.copy_message(self.admin_id, m.chat_id, m.message_id,
-                                       reply_markup=self._confirm())
+        if m.text is not None:
+            await context.bot.send_message(
+                self.admin_id, self.drafts[uid]["text_html"],
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                reply_markup=self._confirm(),
+            )
+        else:
+            await context.bot.copy_message(self.admin_id, m.chat_id, m.message_id,
+                                           reply_markup=self._confirm())
         raise ApplicationHandlerStop
 
     async def callback(self, update, context):
@@ -126,7 +136,8 @@ class BroadcastManager:
                 return await q.message.reply_text("No eligible bot users found.")
             self.jobs.insert_one({
                 "job_id": job_id, "status": "sending", "source_chat_id": draft["chat_id"],
-                "source_message_id": draft["message_id"], "created_at": utcnow(),
+                "source_message_id": draft["message_id"],
+                "text_html": draft.get("text_html"), "created_at": utcnow(),
                 "updated_at": utcnow(), "total_at_start": audience, "sent": 0, "failed": 0,
                 "skipped": 0, "last_user_id": 0, "failures": [],
             })
@@ -199,9 +210,16 @@ class BroadcastManager:
                         if self.jobs.find_one({"job_id": job_id})["status"] != "sending":
                             return
                         try:
-                            await app.bot.copy_message(chat_id=uid,
-                                from_chat_id=job["source_chat_id"],
-                                message_id=job["source_message_id"], protect_content=False)
+                            if job.get("text_html") is not None:
+                                await app.bot.send_message(
+                                    chat_id=uid, text=job["text_html"],
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True,
+                                )
+                            else:
+                                await app.bot.copy_message(chat_id=uid,
+                                    from_chat_id=job["source_chat_id"],
+                                    message_id=job["source_message_id"], protect_content=False)
                             break
                         except RetryAfter as e:
                             await asyncio.sleep(float(e.retry_after) + 1)

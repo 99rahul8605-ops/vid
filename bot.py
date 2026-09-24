@@ -13,6 +13,7 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -29,6 +30,7 @@ from telegram.error import (
 )
 from telegram.ext import (
     Application,
+    Defaults,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
     ChatMemberHandler,
@@ -295,6 +297,7 @@ def next_batch_no():
 
 async def reply(update, context, text, **kwargs):
     kwargs.setdefault("parse_mode", ParseMode.HTML)
+    kwargs.setdefault("disable_web_page_preview", True)
     return await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
@@ -2080,6 +2083,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .defaults(Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True)))
         .post_init(post_init)
         .post_stop(post_stop)
         .build()
