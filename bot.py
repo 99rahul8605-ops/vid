@@ -924,7 +924,6 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     before = users.find_one({"user_id": uid}) or {}
-    first_verify = not bool(before.get("verified"))
     set_data = {"verified": True, "verified_at": utcnow()}
     if int(before.get("unlocked_batch", 0)) == 0 and published_batch_count() > 0:
         set_data["unlocked_batch"] = 1
@@ -977,12 +976,6 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest:
             pass
 
-    if first_verify:
-        await q.message.reply_text(
-            "👇 <b>Your video menu is ready</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=menu_for(uid),
-        )
 
 
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

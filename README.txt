@@ -1,4 +1,5 @@
-Fast /start: immediate status, non-blocking database access, and asynchronous /start dispatch.
-Broadcast sender database operations no longer block incoming commands.
-Keep your existing .env and other modules. Replace bot.py and broadcast.py only.
-\n/start now shows one animated loading-bar message while access checks run; it becomes the menu or join prompt once finished.\n
+Video Bot: single-message force-join verification fix
+
+After a user passes the required-group verification, the bot edits the existing verification message with the success text and menu. It no longer sends a second “Your video menu is ready” message.
+
+Replace bot.py and broadcast.py from this ZIP. Keep your existing human_verification.py and .env unchanged.
