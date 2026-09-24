@@ -1,5 +1,5 @@
-Video Bot: single-message force-join verification fix
+Video Bot: easy /set formatting + single-message verification + Broadcast.
 
-After a user passes the required-group verification, the bot edits the existing verification message with the success text and menu. It no longer sends a second “Your video menu is ready” message.
+Replace bot.py and broadcast.py from this ZIP. Keep your existing external verification file and .env unchanged.
 
-Replace bot.py and broadcast.py from this ZIP. Keep your existing human_verification.py and .env unchanged.
+/set: Enter regular Telegram text; use Telegram bold/italic/links and line breaks. The bot converts the actual rich-text formatting to safe Telegram HTML and previews it before saving. Buttons remain plain-text; timer remains numeric. No manual Markdown/HTML required.

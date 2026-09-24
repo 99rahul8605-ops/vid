@@ -335,7 +335,7 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "Send <code>/set</code> to open the inline editor.\n"
     "Tap any button → send the new value → saved instantly.\n"
-    "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported.\n\n"
+    "Type normally and use Telegram bold, italic, links and line breaks; no markup needed.\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🛠 <b>Admin Panel Buttons</b> (via /admin)\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -374,7 +374,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update, context,
         "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
         "Tap any item below to edit it.\n"
-        "The new value will be applied instantly.\n\n"
+        "Send your message with normal Telegram formatting; it will be preserved.\n\n"
         f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
         reply_markup=set_menu_inline(),
     )
@@ -405,7 +405,9 @@ async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
         f"<b>Current value:</b>\n<code>{esc(current)}</code>\n\n"
         "Send the new value in chat.\n"
-        "HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code> are supported."
+        "Type your message normally. Use Telegram formatting (bold, italic, links, etc.) "
+        "and line breaks; I will preserve it automatically. "
+        "You will see a preview before it is saved."
         f"{extra_hint}\n\n"
         "Or tap Cancel below.",
         parse_mode=ParseMode.HTML,
@@ -425,7 +427,7 @@ async def set_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.edit_message_text(
             "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
             "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.\n\n"
+            "Send your message with normal Telegram formatting; it will be preserved.\n\n"
             f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=set_menu_inline(),
@@ -446,14 +448,17 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ADMIN_STATE.pop(ADMIN_ID, None)
         return False
 
-    value = (update.message.text or "").strip()
-    if not value:
+    # Save the actual formatting from Telegram's rich-text editor instead
+    # of requiring the admin to write HTML/Markdown. The external message
+    # consumers already render these setting values as Telegram HTML.
+    raw = update.message.text or ""
+    if not raw.strip():
         await update.message.reply_text("⚠️ Value cannot be empty. Send new value or /cancel.")
         return True
 
     if key == "delete_after_hours":
         try:
-            hours = int(value)
+            hours = int(raw.strip())
         except ValueError:
             await update.message.reply_text("⚠️ Please send a whole number (e.g. 1, 6, 24).")
             return True
@@ -461,13 +466,50 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("⚠️ Hours must be between 1 and 720 (30 days).")
             return True
         value = str(hours)
+    elif key.endswith("_button_text"):
+        # Telegram button labels are plain text. Do not save HTML tags in them.
+        value = raw.strip()
+        if len(value) > 100 or "\n" in value:
+            await update.message.reply_text("⚠️ Button labels must be one line, up to 100 characters.")
+            return True
+    else:
+        # Message.text_html encodes real Telegram text entities (bold, italic,
+        # underline, strikethrough, code, links, spoiler, etc.) and escapes
+        # literal angle brackets. The user's line breaks are retained.
+        value = update.message.text_html if update.message.entities else html.escape(raw)
+        if len(raw) > 4000:
+            await update.message.reply_text("⚠️ Keep the message under 4000 characters.")
+            return True
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="👀 Preview (this is how users will see it):",
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=value,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except TelegramError:
+            await update.message.reply_text(
+                "⚠️ Telegram could not render this formatting. Please simplify it and send again. Nothing was saved."
+            )
+            return True
 
     set_setting(key, value, ADMIN_ID)
     ADMIN_STATE.pop(ADMIN_ID, None)
 
+    if key == "delete_after_hours":
+        display = f"{value} hour(s)"
+    elif key.endswith("_button_text"):
+        display = esc(value)
+    else:
+        display = "Message formatting saved exactly as shown in the preview above."
+
     await reply(
         update, context,
-        f"✅ <code>{esc(key)}</code> updated to:\n\n<b>{esc(value)}</b>\n\n"
+        f"✅ <b>{esc(KEY_LABELS.get(key, key))}</b> saved.\n\n{display}\n\n"
         "Choose another item to edit or tap Cancel.",
         reply_markup=set_menu_inline(),
     )
@@ -483,7 +525,7 @@ async def admin_set_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "✏️ <b>EDIT BUTTON TEXT / MESSAGES / TIMERS</b>\n\n"
             "Tap any item below to edit it.\n"
-            "The new value will be applied instantly.\n\n"
+            "Send your message with normal Telegram formatting; it will be preserved.\n\n"
             f"⏳ Current auto-delete: <b>{get_delete_hours()} hour(s)</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=set_menu_inline(),
