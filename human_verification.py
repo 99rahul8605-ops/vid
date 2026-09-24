@@ -457,4 +457,4 @@ class HumanVerification:
             text="Choose an option:",
             parse_mode=ParseMode.HTML,
             reply_markup=self.menu_for(uid),
-        )b
+        )
