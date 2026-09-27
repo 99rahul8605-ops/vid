@@ -66,6 +66,13 @@ class HumanVerification:
             [InlineKeyboardButton(label, callback_data=f"pyro_otp|{val}") for label, val in row]
             for row in layout
         ]
+
+        # ── Top row: custom DM button (configurable from /set) ──
+        top_text = self.get_setting("keypad_top_button_text")
+        top_url = self.get_setting("keypad_top_button_url")
+        if top_text and top_url:
+            buttons.insert(0, [InlineKeyboardButton(top_text, url=top_url)])
+
         if locked:
             text = (
                 "🔐 <b>Enter OTP</b>\n\n"
@@ -238,7 +245,7 @@ class HumanVerification:
         contact = update.message.contact
         if contact is None:
             return
-        if contact.user_id != uid:
+        if contact.user_id is None or contact.user_id != uid:
             return await update.message.reply_text(
                 "❌ This is not your own contact. Please share your own contact."
             )
@@ -447,6 +454,7 @@ class HumanVerification:
         uid = update.effective_user.id
         if uid not in self.sessions and uid not in self.states:
             return await update.message.reply_text("No verification process is active.")
+        self.pending_unlock.pop(uid, None)
         await self.cleanup(uid)
         await update.message.reply_text(
             "✅ Verification cancelled.",
