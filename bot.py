@@ -1,4 +1,7 @@
 import asyncio
+
+# Python 3.14 compatibility for Pyrogram
+asyncio.set_event_loop(asyncio.new_event_loop())
 import html
 import logging
 import math
