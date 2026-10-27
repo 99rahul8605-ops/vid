@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?", 1)[0] in ("/", "/health"):
-            body = b"OK\n"
+            body = b"OK bot is runing fine\n"
             self.send_response(200)
         else:
             body = b"Not Found\n"
