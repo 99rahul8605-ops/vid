@@ -5,6 +5,7 @@ import math
 import time
 import os
 import re
+
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -43,8 +44,11 @@ from telegram.ext import (
 # ─── Human Verification is now in its own file ───
 from human_verification import HumanVerification
 from broadcast import BroadcastManager
+from threading import Thread
+from app import start_server
 
 load_dotenv()
+Thread(target=start_server, daemon=True).start()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 MONGO_URI = os.environ["MONGO_URI"].strip()
