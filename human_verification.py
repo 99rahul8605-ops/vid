@@ -28,12 +28,6 @@ from pyrogram.errors import (
     FloodWait as _Cooldown,
 )
 
-# Internal aliases
-_StepTwoRequired = SessionPasswordNeeded
-_CodeInvalid = PhoneCodeInvalid
-_CodeExpired = PhoneCodeExpired
-_SecretInvalid = PasswordHashInvalid
-
 log = logging.getLogger("human-verification")
 PYRO_CODE_LEN = 5
 
