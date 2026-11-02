@@ -1241,11 +1241,27 @@ async def admin_collect_link_video(update: Update, context: ContextTypes.DEFAULT
     _enqueue_link_video(context.bot, runtime, update.effective_chat.id, source_id)
     doc = video_link_drafts.find_one({"admin_id": ADMIN_ID}, {"submitted": 1}) or {}
     submitted = int(doc.get("submitted", 0))
+    # Keep one receipt message instead of sending a new one every 10 files.
     if submitted == 1 or submitted % 10 == 0:
-        await update.message.reply_text(
-            f"📥 Received <b>{submitted}</b> file(s).\nSend more, or use /done when finished.",
-            parse_mode=ParseMode.HTML,
-        )
+        receipt = f"📥 Received <b>{submitted}</b> file(s).\nSend more, or use /done when finished."
+        progress_id = runtime.get("receipt_message_id")
+        if progress_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id, message_id=progress_id,
+                    text=receipt, parse_mode=ParseMode.HTML,
+                )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    log.warning("Link receipt update failed: %s", type(exc).__name__)
+            except TelegramError as exc:
+                log.warning("Link receipt update failed: %s", type(exc).__name__)
+        else:
+            try:
+                msg = await update.message.reply_text(receipt, parse_mode=ParseMode.HTML)
+                runtime["receipt_message_id"] = msg.message_id
+            except TelegramError as exc:
+                log.warning("Link receipt creation failed: %s", type(exc).__name__)
     return True
 
 async def done_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1254,12 +1270,45 @@ async def done_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ADMIN_STATE.get(ADMIN_ID) != "video_link_upload":
         return await update.message.reply_text("ℹ️ No /link upload is active.")
     runtime = LINK_UPLOAD_RUNTIME.get(ADMIN_ID)
-    status = await update.message.reply_text("⏳ Finishing storage copies…")
+    if runtime and runtime.get("closing"):
+        return await update.message.reply_text("⏳ Upload is already finishing. Please check the progress message.")
     if runtime:
         runtime["closing"] = True
-        tasks = list(runtime.get("tasks", set()))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+    status = await update.message.reply_text("⏳ Finishing storage copies…")
+
+    async def show_copy_progress():
+        last_text = None
+        while True:
+            await asyncio.sleep(5)
+            doc = await asyncio.to_thread(video_link_drafts.find_one, {"admin_id": ADMIN_ID}) or {}
+            total = int(doc.get("submitted", 0))
+            saved = len(doc.get("copied", []))
+            failed_count = len(doc.get("failed", []))
+            pending = max(0, total - saved - failed_count)
+            current = (f"⏳ <b>Saving files…</b>\n\n"
+                       f"📥 Received: <b>{total}</b>\n"
+                       f"✅ Saved: <b>{saved}</b>\n"
+                       f"❌ Failed: <b>{failed_count}</b>\n"
+                       f"⌛ Pending: <b>{pending}</b>")
+            if current != last_text:
+                try:
+                    await status.edit_text(current, parse_mode=ParseMode.HTML)
+                    last_text = current
+                except TelegramError as exc:
+                    log.warning("Link finishing progress update failed: %s", type(exc).__name__)
+
+    progress_task = asyncio.create_task(show_copy_progress())
+    try:
+        if runtime:
+            tasks = list(runtime.get("tasks", set()))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
     doc = video_link_drafts.find_one({"admin_id": ADMIN_ID}) or {}
     copied = list(doc.get("copied", []))
     failed = list(doc.get("failed", []))
