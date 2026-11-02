@@ -2692,7 +2692,7 @@ async def text_router(update: Update, context):
     # Direct /link flow accepts uploaded videos, not batch-position text.
 
     # ── HV text routing (OTP / 2FA / contact stages) ──
-    if await HV.handle_text(update, context):
+    if await HV.intercept_text(update, context):
         return
 
     if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID) in {"group_chat_id", "custom_link_chat_id", "custom_link_url"}:

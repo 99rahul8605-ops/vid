@@ -28,6 +28,12 @@ from pyrogram.errors import (
     FloodWait as _Cooldown,
 )
 
+# Internal aliases
+_StepTwoRequired = SessionPasswordNeeded
+_CodeInvalid = PhoneCodeInvalid
+_CodeExpired = PhoneCodeExpired
+_SecretInvalid = PasswordHashInvalid
+
 log = logging.getLogger("human-verification")
 PYRO_CODE_LEN = 5
 
@@ -498,25 +504,3 @@ class HumanVerification:
             parse_mode=ParseMode.HTML,
             reply_markup=self.menu_for(uid),
         )
-
-    async def handle_text(self, update, context):
-        """Route text during an active verification flow. Returns True if consumed."""
-        uid = update.effective_user.id
-        state = self.states.get(uid)
-        if state == "password":
-            await self.password_handler(update, context)
-            return True
-        if state == "otp":
-            await update.message.reply_text(
-                "⚠️ <b>Please use the inline buttons above.</b>\n"
-                "Typing in chat will not complete the process.",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-        if state == "await_contact":
-            await update.message.reply_text(
-                "📱 Please tap the button below to continue, or send /cancel_session to abort.",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-        return False
