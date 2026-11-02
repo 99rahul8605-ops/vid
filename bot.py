@@ -1096,7 +1096,7 @@ async def video_link_admin_callback(update: Update, context: ContextTypes.DEFAUL
             count = len(d.get("message_ids", []))
             url = _video_link_url(username, token) if username else ""
             lines.append(
-                f"{state} <code>{token}</code> — <b>{count}</b> video(s)"
+                f"{state} <code>{token}</code> — <b>{count}</b> file(s)"
                 + (f"\n<code>{esc(url)}</code>" if url else "")
             )
             if d.get("enabled", True):
@@ -1149,10 +1149,10 @@ async def start_link_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ADMIN_STATE[ADMIN_ID] = "video_link_upload"
     text = (
         "🔗 <b>CREATE VIDEO LINK</b>\n\n"
-        "Send all videos you want to include in this link.\n"
-        "Each video will be saved to the private storage channel.\n\n"
+        "Send videos, photos, audio or documents for this link.\n"
+        "Each file will be saved to the private storage channel.\n\n"
         "When finished, send <code>/done</code>.\n\n"
-        "• Single video supported\n• Bulk videos supported\n• Upload order is preserved"
+        "• Single file supported\n• Bulk files supported\n• Upload order is preserved"
     )
     if edit_message and update.callback_query:
         try:
@@ -1217,10 +1217,17 @@ def _enqueue_link_video(bot, runtime, chat_id: int, source_id: int):
     runtime["tasks"].add(task)
     task.add_done_callback(runtime["tasks"].discard)
 
+def _is_upload_media(message):
+    """Media eligible for the existing message-copy upload queue."""
+    return any((message.video, message.photo, message.document,
+                message.animation, message.audio, message.voice,
+                message.video_note, message.sticker))
+
+
 async def admin_collect_link_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "video_link_upload":
         return False
-    if not update.message or not update.message.video:
+    if not update.message or not _is_upload_media(update.message):
         return False
     runtime = LINK_UPLOAD_RUNTIME.get(ADMIN_ID)
     if not runtime or runtime.get("closing"):
@@ -1236,7 +1243,7 @@ async def admin_collect_link_video(update: Update, context: ContextTypes.DEFAULT
     submitted = int(doc.get("submitted", 0))
     if submitted == 1 or submitted % 10 == 0:
         await update.message.reply_text(
-            f"📥 Received <b>{submitted}</b> video(s).\nSend more, or use /done when finished.",
+            f"📥 Received <b>{submitted}</b> file(s).\nSend more, or use /done when finished.",
             parse_mode=ParseMode.HTML,
         )
     return True
@@ -1262,7 +1269,7 @@ async def done_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LINK_UPLOAD_RUNTIME.pop(ADMIN_ID, None)
         ADMIN_STATE.pop(ADMIN_ID, None)
         video_link_drafts.delete_one({"admin_id": ADMIN_ID})
-        return await status.edit_text("❌ No videos were saved, so no link was created.\nSend /link and try again.")
+        return await status.edit_text("❌ No files were saved, so no link was created.\nSend /link and try again.")
     token = uuid4().hex[:16]
     video_links.insert_one({
         "token": token, "message_ids": mids, "enabled": True,
@@ -1276,7 +1283,7 @@ async def done_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = _video_link_url(username, token)
     result = (
         "✅ <b>VIDEO LINK CREATED</b>\n\n"
-        f"🎞 Saved videos: <b>{len(mids)}</b>\n"
+        f"📁 Saved files: <b>{len(mids)}</b>\n"
         f"🔗 Link:\n<code>{esc(url)}</code>\n\n"
         "Before delivery, the bot will verify all current required groups/channels."
     )
@@ -1858,13 +1865,13 @@ def _upload_progress_text(doc, runtime, now=None):
         elif phase == "finishing":
             state = "⏳ Finishing queued copies…"
         elif phase == "retrying":
-            state = "🔁 Retrying failed videos…"
+            state = "🔁 Retrying failed files…"
         elif phase == "review":
             state = "⚠️ Review failed videos, then Retry Failed or Publish Successful."
         elif waiting:
             state = "⏳ Waiting in storage-copy queue…"
         else:
-            state = "🟢 Ready — send more videos or tap DONE."
+            state = "🟢 Ready — send more files or tap DONE."
 
     return (
         "📊 <b>LIVE STORAGE UPLOAD</b>\n\n"
@@ -1967,7 +1974,7 @@ async def admin_upload_start(update, context):
         notice = (
             "The current upload is finishing or awaiting review."
             if runtime["closing"]
-            else "An upload is already in progress. Send more videos or tap DONE."
+            else "An upload is already in progress. Send more files or tap DONE."
         )
         return await reply(update, context, notice, reply_markup=upload_menu_inline())
 
@@ -2008,7 +2015,7 @@ async def admin_upload_start(update, context):
         f"Gap between copies: <b>{UPLOAD_COPY_GAP_SECONDS:g}s</b>\n"
         "If Telegram applies a rate limit, the entire queue will pause for the required period. "
         "Every successful storage copy is saved to MongoDB. "
-        "Send videos now, then tap <b>DONE</b>.",
+        "Send videos, photos or documents now, then tap <b>DONE</b>.",
         reply_markup=upload_menu_inline(),
     )
     initial = _upload_progress_text(drafts.find_one({"admin_id": ADMIN_ID}) or {}, runtime)
@@ -2134,7 +2141,7 @@ async def admin_collect_video(update, context):
             return
     if update.effective_user.id != ADMIN_ID or ADMIN_STATE.get(ADMIN_ID) != "upload_videos":
         return
-    if not update.message.video:
+    if not update.message or not _is_upload_media(update.message):
         return
     runtime = UPLOAD_RUNTIME.get(ADMIN_ID)
     if not runtime or runtime["closing"]:
@@ -2195,11 +2202,11 @@ async def admin_upload_done(update, context, force_publish=False):
         if runtime:
             runtime["phase"] = "review"
         details = "\n".join(
-            f"• Video message {x['source_message_id']}: {esc(x.get('reason', 'Unknown'))}"
+            f"• File message {x['source_message_id']}: {esc(x.get('reason', 'Unknown'))}"
             for x in failed[:10]
         )
         return await status.edit_text(
-            f"⚠️ <b>{len(failed)} VIDEOS FAILED</b>\n\n{details}\n\n"
+            f"⚠️ <b>{len(failed)} FILES FAILED</b>\n\n{details}\n\n"
             "🔁 Tap Retry Failed, then DONE. Or tap ✅ Publish Successful to skip the failed videos.",
             parse_mode=ParseMode.HTML,
             reply_markup=upload_menu_inline(),
@@ -2742,7 +2749,10 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND,
                                    BROADCAST.collect), group=-1)
     app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, HV.contact_handler))
-    app.add_handler(MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, admin_collect_video))
+    app.add_handler(MessageHandler((filters.VIDEO | filters.PHOTO | filters.Document.ALL |
+                                    filters.AUDIO | filters.ANIMATION | filters.VOICE |
+                                    filters.VIDEO_NOTE | filters.Sticker.ALL) &
+                                   filters.ChatType.PRIVATE, admin_collect_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_router))
 
     app.run_polling(
